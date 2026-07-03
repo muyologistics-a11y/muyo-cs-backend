@@ -130,8 +130,16 @@ async function shopeePush(req, res, base) {
   let body = {};
   try { body = JSON.parse(raw || "{}"); } catch {}
 
-  // 記錄原始推送(方便我們確認格式)
-  await sb("push_logs", "POST", { sig_ok: !!sigOk, body }).catch(() => {});
+  // ===== 偵錯用:把驗簽線索一起存進 push_logs(找到問題後可移除)=====
+  const debug = {
+    callback_url_used: callbackUrl,
+    push_key_len: PUSH_KEY.length,
+    push_key_source: process.env.SHOPEE_PUSH_KEY ? "PUSH_KEY" : "fallback_PARTNER_KEY",
+    auth_head: auth.slice(0, 16),
+    expect_head: expect.slice(0, 16),
+  };
+  await sb("push_logs", "POST", { sig_ok: !!sigOk, body: { ...body, _debug: debug } }).catch(() => {});
+  // ================================================================
 
   // 盡量解析「聊聊訊息」→ 建一則待處理訊息
   try {
