@@ -15,6 +15,8 @@ import crypto from "node:crypto";
 // ---- 環境變數(部署時在 Vercel 設定,不寫死在程式裡)----
 const PARTNER_ID = process.env.SHOPEE_PARTNER_ID || "";
 const PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY || "";
+// 蝦皮「推送」用的驗證金鑰(Set Push 頁 Generate 的那組);沒設就退回用 PARTNER_KEY
+const PUSH_KEY = process.env.SHOPEE_PUSH_KEY || process.env.SHOPEE_PARTNER_KEY || "";
 const SHOPEE_HOST = process.env.SHOPEE_HOST || "https://partner.shopeemobile.com";
 const SB_URL = process.env.SUPABASE_URL || "";
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -121,7 +123,8 @@ async function shopeePush(req, res, base) {
   const raw = await readRawBody(req);
   const auth = req.headers["authorization"] || "";
   const callbackUrl = `${base}/api/shopee-push`;
-  const expect = crypto.createHmac("sha256", PARTNER_KEY).update(`${callbackUrl}${raw}`).digest("hex");
+  // 蝦皮推送簽章 = HMAC-SHA256(push_key, callbackUrl + raw_body)
+  const expect = crypto.createHmac("sha256", PUSH_KEY).update(`${callbackUrl}${raw}`).digest("hex");
   const sigOk = auth && auth.toLowerCase() === expect.toLowerCase();
 
   let body = {};
