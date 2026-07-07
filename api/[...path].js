@@ -135,12 +135,12 @@ async function shopeePush(req, res, base) {
     callback_url_used: callbackUrl,
     push_key_len: PUSH_KEY.length,
     push_key_source: process.env.SHOPEE_PUSH_KEY ? "PUSH_KEY" : "fallback_PARTNER_KEY",
-    auth_full: auth,                         // 蝦皮送來的完整簽章
-    expect_full: expect,                     // 我方算出來的完整簽章
-    raw_len: raw ? raw.length : 0,           // 程式拿到的 raw body 長度
-    raw_head: raw ? raw.slice(0, 80) : "",   // raw body 開頭 80 字
-    raw_tail: raw ? raw.slice(-40) : "",     // raw body 結尾 40 字
-    req_body_type: typeof req.body,          // Vercel 是否已經幫忙解析過 body
+    auth_full: auth,
+    expect_full: expect,
+    raw_len: raw ? raw.length : 0,
+    raw_head: raw ? raw.slice(0, 80) : "",
+    raw_tail: raw ? raw.slice(-40) : "",
+    raw_source: req._rawSource || "unknown",   // raw 是用哪個方法讀到的
   };
   await sb("push_logs", "POST", { sig_ok: !!sigOk, body: { ...body, _debug: debug } }).catch(() => {});
   // ================================================================
@@ -207,12 +207,39 @@ async function sbGetCompanyId() {
 // ============================================================
 //  小工具
 // ============================================================
+// 取得「原始、未被動過的」request body 字串。
+// Vercel 有時會先幫忙把 body 解析成物件(即使設了 bodyParser:false),
+// 那樣算簽章就會失敗。這裡優先用 Web 標準的 arrayBuffer() 直接讀原始位元組,
+// 拿不到才依序退回其他方法,確保拿到跟蝦皮簽章時「同一份」原始內容。
 async function readRawBody(req) {
-  if (typeof req.body === "string") return req.body;
-  if (Buffer.isBuffer(req.body)) return req.body.toString("utf8");
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  return Buffer.concat(chunks).toString("utf8");
+  // 1) 最可靠:Web 標準串流,直接讀原始位元組(不會被 JSON 重組)
+  try {
+    if (typeof req.arrayBuffer === "function") {
+      const buf = Buffer.from(await req.arrayBuffer());
+      if (buf && buf.length) { req._rawSource = "arrayBuffer"; return buf.toString("utf8"); }
+    }
+  } catch {}
+
+  // 2) Node 串流:一段一段讀
+  try {
+    if (typeof req[Symbol.asyncIterator] === "function") {
+      const chunks = [];
+      for await (const c of req) chunks.push(typeof c === "string" ? Buffer.from(c) : c);
+      if (chunks.length) { req._rawSource = "stream"; return Buffer.concat(chunks).toString("utf8"); }
+    }
+  } catch {}
+
+  // 3) 已經是字串
+  if (typeof req.body === "string") { req._rawSource = "body_string"; return req.body; }
+
+  // 4) 是 Buffer
+  if (Buffer.isBuffer(req.body)) { req._rawSource = "body_buffer"; return req.body.toString("utf8"); }
+
+  // 5) 最後手段:Vercel 已把它解析成物件 → 重新序列化(可能與原始不同,簽章仍可能失敗,但至少能收下)
+  if (req.body && typeof req.body === "object") { req._rawSource = "body_object_restringify"; return JSON.stringify(req.body); }
+
+  req._rawSource = "empty";
+  return "";
 }
 function text(res, code, s) {
   res.statusCode = code;
