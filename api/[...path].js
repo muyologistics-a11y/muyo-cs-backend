@@ -135,8 +135,12 @@ async function shopeePush(req, res, base) {
     callback_url_used: callbackUrl,
     push_key_len: PUSH_KEY.length,
     push_key_source: process.env.SHOPEE_PUSH_KEY ? "PUSH_KEY" : "fallback_PARTNER_KEY",
-    auth_head: auth.slice(0, 16),
-    expect_head: expect.slice(0, 16),
+    auth_full: auth,                         // 蝦皮送來的完整簽章
+    expect_full: expect,                     // 我方算出來的完整簽章
+    raw_len: raw ? raw.length : 0,           // 程式拿到的 raw body 長度
+    raw_head: raw ? raw.slice(0, 80) : "",   // raw body 開頭 80 字
+    raw_tail: raw ? raw.slice(-40) : "",     // raw body 結尾 40 字
+    req_body_type: typeof req.body,          // Vercel 是否已經幫忙解析過 body
   };
   await sb("push_logs", "POST", { sig_ok: !!sigOk, body: { ...body, _debug: debug } }).catch(() => {});
   // ================================================================
