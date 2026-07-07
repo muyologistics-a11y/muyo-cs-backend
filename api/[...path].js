@@ -117,7 +117,7 @@ async function authCallback(req, res, url) {
 
 // ============================================================
 //  接收蝦皮推送(買家訊息等)
-//  驗簽章 → 存原始內容 → 解析成一則訊息(待客服)→ 回 200
+//  驗簽章 → 存原始內容 → 解析成一則訊息(待客服,防重複)→ 回 200
 // ============================================================
 async function shopeePush(req, res, base) {
   const raw = await readRawBody(req);
@@ -138,7 +138,7 @@ async function shopeePush(req, res, base) {
   // 簽章沒過 → 不是蝦皮送的(或被竄改),不往下處理
   if (!sigOk) return text(res, 200, "ok");
 
-  // 解析「聊聊訊息」→ 建一則待處理訊息
+  // 解析「聊聊訊息」→ 建一則待處理訊息(自帶防重複)
   try {
     await tryHandleChat(body);
   } catch (e) { console.error("parse chat error:", e); }
@@ -149,35 +149,40 @@ async function shopeePush(req, res, base) {
 // ============================================================
 //  解析蝦皮聊聊訊息
 //  ★ 實際結構(買家傳給賣場):
-//    body.code = 10
 //    body.shop_id = 賣場ID(最外層)
 //    body.data.type = "message"
 //    body.data.content = {
-//        to_id, to_shop_id(賣場), from_id(買家), from_user_name(買家名),
-//        conversation_id, message_type,
+//        to_shop_id(賣場), from_id(買家), from_user_name(買家名),
+//        conversation_id, message_id(訊息唯一編號,用來防重複),
 //        content: { text: "訊息文字" }   ← 文字在這裡,再深一層
 //    }
+//  ★ 防重複:同一則訊息蝦皮會推多次,靠 message_id + 資料庫唯一約束擋掉。
 // ============================================================
 async function tryHandleChat(body) {
   const d = body.data || {};
-  if (d.type !== "message") return;          // 只處理聊聊訊息,其他(mark_as_replied 等)略過
+  if (d.type !== "message") return;          // 只處理聊聊訊息,其他略過
   const c = d.content || {};                 // 訊息主體都在 data.content 底下
 
-  // 賣場 ID:買家傳給賣場,所以看 to_shop_id;退而求其次用最外層 shop_id
   const shopId = c.to_shop_id || body.shop_id || d.shop_id || null;
-  // 訊息文字:在 data.content.content.text(再深一層)
   const messageText = c.content?.text || c.text || null;
-  // 買家資訊
   const buyerId = c.from_id || null;
   const buyerName = c.from_user_name || null;
   const conversationId = c.conversation_id || null;
+  const messageId = c.message_id || d.message_id || null;   // 訊息唯一編號
 
   if (!shopId || !messageText) return;       // 抓不到就略過(已記在 push_logs)
+
+  // 防重複第一關:先查這個 message_id 是否已存在
+  if (messageId) {
+    const dup = await sb(`messages?shopee_message_id=eq.${encodeURIComponent(String(messageId))}&select=id`);
+    if (Array.isArray(dup) && dup.length) return;  // 已經有了 → 跳過,不重複寫
+  }
 
   const shops = await sb(`shops?shopee_shop_id=eq.${shopId}&select=id,company_id`);
   if (!shops.length) return;                 // 找不到對應賣場(可能還沒授權)
   const shop = shops[0];
 
+  // 防重複第二關:寫入時若撞到唯一約束(同一 message_id),Supabase 會回錯,安靜忽略即可
   await sb("messages", "POST", {
     company_id: shop.company_id,
     shop_id: shop.id,
@@ -185,8 +190,9 @@ async function tryHandleChat(body) {
     buyer_id: buyerId ? String(buyerId) : null,
     buyer_name: buyerName || null,
     customer_message: String(messageText),
+    shopee_message_id: messageId ? String(messageId) : null,
     status: "pending",
-  });
+  }).catch(() => {});
 }
 
 // ============================================================
