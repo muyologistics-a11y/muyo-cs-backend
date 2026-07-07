@@ -117,14 +117,14 @@ async function authCallback(req, res, url) {
 
 // ============================================================
 //  接收蝦皮推送(買家訊息等)
-//  驗簽章 → 存原始內容 → 盡量解析成一則訊息(待客服)→ 回 200
+//  驗簽章 → 存原始內容 → 解析成一則訊息(待客服)→ 回 200
 // ============================================================
 async function shopeePush(req, res, base) {
   const raw = await readRawBody(req);
   const auth = (req.headers["authorization"] || "").toLowerCase();
   const callbackUrl = `${base}/api/shopee-push`;
   // ★ 蝦皮推送簽章 = HMAC-SHA256(push_key, callbackUrl + "|" + raw_body),hex
-  //    注意中間的「|」直線符號是必要的(這是卡最久的關鍵細節)
+  //    注意中間的「|」直線符號是必要的
   const expect = crypto.createHmac("sha256", PUSH_KEY)
     .update(`${callbackUrl}|${raw}`).digest("hex").toLowerCase();
   const sigOk = !!auth && auth === expect;
@@ -132,13 +132,13 @@ async function shopeePush(req, res, base) {
   let body = {};
   try { body = JSON.parse(raw || "{}"); } catch {}
 
-  // 記錄推送(保留一份,方便日後查問題;不含機密)
+  // 記錄推送(保留一份,方便日後查問題)
   await sb("push_logs", "POST", { sig_ok: sigOk, body }).catch(() => {});
 
   // 簽章沒過 → 不是蝦皮送的(或被竄改),不往下處理
   if (!sigOk) return text(res, 200, "ok");
 
-  // 盡量解析「聊聊訊息」→ 建一則待處理訊息
+  // 解析「聊聊訊息」→ 建一則待處理訊息
   try {
     await tryHandleChat(body);
   } catch (e) { console.error("parse chat error:", e); }
@@ -146,22 +146,36 @@ async function shopeePush(req, res, base) {
   return text(res, 200, "ok");
 }
 
+// ============================================================
+//  解析蝦皮聊聊訊息
+//  ★ 實際結構(買家傳給賣場):
+//    body.code = 10
+//    body.shop_id = 賣場ID(最外層)
+//    body.data.type = "message"
+//    body.data.content = {
+//        to_id, to_shop_id(賣場), from_id(買家), from_user_name(買家名),
+//        conversation_id, message_type,
+//        content: { text: "訊息文字" }   ← 文字在這裡,再深一層
+//    }
+// ============================================================
 async function tryHandleChat(body) {
-  // 蝦皮 push 格式:{ shop_id, code, data: {...} }
-  const shopId = body.shop_id || body.data?.shop_id;
   const d = body.data || {};
-  const content = d.content || d.message || {};
-  // 各種可能欄位,盡量抓文字
-  const messageText =
-    content.text || content?.content?.text || d.message_text || d.text || null;
-  const buyerId = d.from_id || d.from_user_id || content.from_id || null;
-  const buyerName = d.from_user_name || d.from_name || content.from_user_name || null;
-  const conversationId = d.conversation_id || content.conversation_id || null;
+  if (d.type !== "message") return;          // 只處理聊聊訊息,其他(mark_as_replied 等)略過
+  const c = d.content || {};                 // 訊息主體都在 data.content 底下
 
-  if (!shopId || !messageText) return; // 不是聊聊訊息就略過(已記在 push_logs)
+  // 賣場 ID:買家傳給賣場,所以看 to_shop_id;退而求其次用最外層 shop_id
+  const shopId = c.to_shop_id || body.shop_id || d.shop_id || null;
+  // 訊息文字:在 data.content.content.text(再深一層)
+  const messageText = c.content?.text || c.text || null;
+  // 買家資訊
+  const buyerId = c.from_id || null;
+  const buyerName = c.from_user_name || null;
+  const conversationId = c.conversation_id || null;
+
+  if (!shopId || !messageText) return;       // 抓不到就略過(已記在 push_logs)
 
   const shops = await sb(`shops?shopee_shop_id=eq.${shopId}&select=id,company_id`);
-  if (!shops.length) return; // 找不到對應賣場
+  if (!shops.length) return;                 // 找不到對應賣場(可能還沒授權)
   const shop = shops[0];
 
   await sb("messages", "POST", {
