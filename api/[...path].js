@@ -33,12 +33,17 @@ export default async function handler(req, res) {
     const url = new URL(req.url, base);
     const path = url.pathname.replace(/^\/api/, "");
 
+    // CORS:允許後台網頁(github.io)呼叫;先回應瀏覽器的預檢(OPTIONS)
+    setCors(res);
+    if (req.method === "OPTIONS") { res.statusCode = 204; res.end(); return; }
+
     if (path === "/health" || path === "" || path === "/") {
       return text(res, 200, "沐曜客服系統 後端運作中 ✅");
     }
     if (path === "/auth-start") return authStart(req, res, base);
     if (path === "/auth-callback") return authCallback(req, res, url);
     if (path === "/shopee-push") return shopeePush(req, res, base);
+    if (path === "/send-reply") return sendReply(req, res);
 
     return text(res, 404, "Not found");
   } catch (e) {
@@ -46,6 +51,13 @@ export default async function handler(req, res) {
     // 對蝦皮 push 一律回 200,避免它一直重送
     return text(res, 200, "ok");
   }
+}
+
+// CORS 標頭:允許後台網頁跨網域呼叫送訊 API
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
 // ============================================================
@@ -245,6 +257,98 @@ async function tryHandleReplied(body) {
 }
 
 // ============================================================
+//  系統後台「送出給客人」→ 真的送回蝦皮聊聊
+//  後台網頁 POST 過來:{ conversation_id, shopee_shop_id, message, to_id }
+//  流程:找賣場 → (token 過期先換新) → 呼叫蝦皮送訊 API
+// ============================================================
+async function sendReply(req, res) {
+  const raw = await readRawBody(req);
+  let payload = {};
+  try { payload = JSON.parse(raw || "{}"); } catch {}
+  const { conversation_id, shopee_shop_id, message, to_id } = payload;
+
+  if (!shopee_shop_id || !message || (!conversation_id && !to_id)) {
+    return json(res, 400, { ok: false, error: "缺少必要參數(shop/message/對象)" });
+  }
+
+  // 找賣場 + token
+  const shops = await sb(`shops?shopee_shop_id=eq.${shopee_shop_id}&select=id,shopee_shop_id,access_token,refresh_token,token_expire_at`);
+  if (!shops.length) return json(res, 404, { ok: false, error: "找不到這個賣場(可能未授權)" });
+  let shop = shops[0];
+
+  // token 過期就先換新
+  try {
+    shop = await ensureFreshToken(shop);
+  } catch (e) {
+    return json(res, 500, { ok: false, error: "換取新 token 失敗:" + String(e.message || e) });
+  }
+  if (!shop.access_token) return json(res, 400, { ok: false, error: "這個賣場沒有 access_token,請重新授權" });
+
+  // 呼叫蝦皮送訊 API
+  const apiPath = "/api/v2/sellerchat/send_message";
+  const ts = Math.floor(Date.now() / 1000);
+  const sign = signShop(apiPath, ts, shop.access_token, Number(shop.shopee_shop_id));
+  const apiUrl = `${SHOPEE_HOST}${apiPath}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${shop.access_token}&shop_id=${shop.shopee_shop_id}`;
+
+  // 送訊對象:優先用 conversation_id;沒有就用 to_id(買家 id)
+  const bodyObj = conversation_id
+    ? { conversation_id: String(conversation_id), message_type: "text", content: { text: String(message) } }
+    : { to_id: Number(to_id), message_type: "text", content: { text: String(message) } };
+
+  let data = {};
+  try {
+    const r = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(bodyObj),
+    });
+    data = await r.json();
+  } catch (e) {
+    return json(res, 502, { ok: false, error: "呼叫蝦皮送訊失敗:" + String(e.message || e) });
+  }
+
+  // 蝦皮回應:error 為空字串代表成功
+  if (data.error) {
+    return json(res, 200, { ok: false, error: data.error, message: data.message || "", shopee: data });
+  }
+  return json(res, 200, { ok: true, shopee: data });
+}
+
+// token 若已過期(或快過期),用 refresh_token 換新的,並存回 shops
+async function ensureFreshToken(shop) {
+  const now = Date.now();
+  const exp = shop.token_expire_at ? new Date(shop.token_expire_at).getTime() : 0;
+  // 還有 5 分鐘以上就沿用
+  if (exp - now > 5 * 60 * 1000 && shop.access_token) return shop;
+
+  if (!shop.refresh_token) return shop; // 沒 refresh_token 就沒辦法換,交由後續判斷
+
+  const path = "/api/v2/auth/access_token/get";
+  const ts = Math.floor(Date.now() / 1000);
+  const sign = signPublic(path, ts);
+  const url = `${SHOPEE_HOST}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      partner_id: Number(PARTNER_ID),
+      shop_id: Number(shop.shopee_shop_id),
+      refresh_token: shop.refresh_token,
+    }),
+  });
+  const d = await r.json();
+  if (!d.access_token) throw new Error(JSON.stringify(d));
+
+  const expireAt = new Date(Date.now() + (d.expire_in || 14400) * 1000).toISOString();
+  await sb(`shops?id=eq.${shop.id}`, "PATCH", {
+    access_token: d.access_token,
+    refresh_token: d.refresh_token || shop.refresh_token,
+    token_expire_at: expireAt,
+  });
+  return { ...shop, access_token: d.access_token, refresh_token: d.refresh_token || shop.refresh_token, token_expire_at: expireAt };
+}
+
+// ============================================================
 //  Supabase REST 小工具(用 service key,可寫入)
 // ============================================================
 async function sb(pathAndQuery, method = "GET", bodyObj) {
@@ -296,6 +400,12 @@ function text(res, code, s) {
   res.statusCode = code;
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.end(s);
+}
+function json(res, code, obj) {
+  res.statusCode = code;
+  setCors(res);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(obj));
 }
 function html(res, code, s) {
   res.statusCode = code;
