@@ -265,7 +265,7 @@ async function sendReply(req, res) {
   const raw = await readRawBody(req);
   let payload = {};
   try { payload = JSON.parse(raw || "{}"); } catch {}
-  const { conversation_id, shopee_shop_id, message, to_id } = payload;
+  const { conversation_id, shopee_shop_id, message, to_id, region } = payload;
 
   if (!shopee_shop_id || !message || (!conversation_id && !to_id)) {
     return json(res, 400, { ok: false, error: "缺少必要參數(shop/message/對象)" });
@@ -290,10 +290,11 @@ async function sendReply(req, res) {
   const sign = signShop(apiPath, ts, shop.access_token, Number(shop.shopee_shop_id));
   const apiUrl = `${SHOPEE_HOST}${apiPath}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${shop.access_token}&shop_id=${shop.shopee_shop_id}`;
 
-  // 送訊對象:優先用 conversation_id;沒有就用 to_id(買家 id)
-  const bodyObj = conversation_id
-    ? { conversation_id: String(conversation_id), message_type: "text", content: { text: String(message) } }
-    : { to_id: Number(to_id), message_type: "text", content: { text: String(message) } };
+  // 送訊主體:蝦皮 sellerchat 用 to_id(買家 id)發送最穩;帶上 region(如 TW),否則會回 not_open_market
+  const bodyObj = { message_type: "text", content: { text: String(message) } };
+  if (to_id) bodyObj.to_id = Number(to_id);
+  else if (conversation_id) bodyObj.conversation_id = String(conversation_id);
+  if (region) bodyObj.region = String(region);
 
   let data = {};
   try {
