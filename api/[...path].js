@@ -138,10 +138,19 @@ async function shopeePush(req, res, base) {
   // 簽章沒過 → 不是蝦皮送的(或被竄改),不往下處理
   if (!sigOk) return text(res, 200, "ok");
 
-  // 解析「聊聊訊息」→ 建一則待處理訊息(自帶防重複)
+  // 依 type 分派處理:
+  //  - message           : 買家傳來的聊聊訊息 → 建待處理訊息
+  //  - notification/mark_as_replied : 賣家(在蝦皮後台)回覆了 → 把該對話轉為已回覆
   try {
-    await tryHandleChat(body);
-  } catch (e) { console.error("parse chat error:", e); }
+    const dtype = body?.data?.type;
+    const ctype = body?.data?.content?.type;
+    if (dtype === "message") {
+      await tryHandleChat(body);
+    } else if (dtype === "notification" && ctype === "mark_as_replied") {
+      await tryHandleReplied(body);
+    }
+    // 其他類型的通知目前不處理(已記在 push_logs)
+  } catch (e) { console.error("handle push error:", e); }
 
   return text(res, 200, "ok");
 }
@@ -193,6 +202,46 @@ async function tryHandleChat(body) {
     shopee_message_id: messageId ? String(messageId) : null,
     status: "pending",
   }).catch(() => {});
+}
+
+// ============================================================
+//  處理「賣家已回覆」通知(你們在蝦皮後台回覆時,蝦皮會推這個)
+//  ★ 實際結構:
+//    body.shop_id = 賣場ID
+//    body.data.type = "notification"
+//    body.data.content = {
+//        type: "mark_as_replied",
+//        conversation_id: "...",           ← 哪則對話被回了
+//        content: { conversation_id: "..." }
+//    }
+//  作法:把該對話(同 conversation_id)還「待處理 / 處理中」的訊息,
+//        全部轉成 done,並記註記「已於蝦皮後台回覆」。
+//        (共用蝦皮帳號、分不出是誰回的,依佳芬決定:不分人)
+// ============================================================
+async function tryHandleReplied(body) {
+  const d = body.data || {};
+  const c = d.content || {};
+  const shopId = body.shop_id || d.shop_id || c.to_shop_id || null;
+  const conversationId =
+    c.conversation_id || c.content?.conversation_id || d.conversation_id || null;
+
+  if (!shopId || !conversationId) return;   // 資訊不足就略過(已記在 push_logs)
+
+  // 找到對應賣場
+  const shops = await sb(`shops?shopee_shop_id=eq.${shopId}&select=id`);
+  if (!shops.length) return;
+  const shop = shops[0];
+
+  // 把這個對話裡「還沒完成」的訊息(pending / handling)轉成 done。
+  // 已經是 done 或 auto_sent 的不動。
+  const now = new Date().toISOString();
+  await sb(
+    `messages?shop_id=eq.${shop.id}` +
+    `&conversation_id=eq.${encodeURIComponent(String(conversationId))}` +
+    `&status=in.(pending,handling)`,
+    "PATCH",
+    { status: "done", reply_text: "(已於蝦皮後台回覆)", handled_at: now }
+  ).catch(() => {});
 }
 
 // ============================================================
