@@ -21,6 +21,9 @@ const SHOPEE_HOST = process.env.SHOPEE_HOST || "https://partner.shopeemobile.com
 const SB_URL = process.env.SUPABASE_URL || "";
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const COMPANY_NAME = process.env.COMPANY_NAME || "沐曜實業";
+// Gemini(生成 AI 草稿用);沒設金鑰就跳過生成,不擋收訊流程
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 // Vercel:不要自動解析 body,我們要原始內容來驗簽章
 export const config = { api: { bodyParser: false } };
@@ -203,6 +206,14 @@ async function tryHandleChat(body) {
   if (!shops.length) return;                 // 找不到對應賣場(可能還沒授權)
   const shop = shops[0];
 
+  // 生成 AI 草稿(參考同一段對話的歷史訊息當上下文);失敗也不擋訊息存檔,草稿留空即可
+  let aiDraft = "";
+  try {
+    aiDraft = await generateAiDraft({ shopId: shop.id, conversationId, buyerId, buyerName, messageText });
+  } catch (e) {
+    console.error("generateAiDraft error:", e);
+  }
+
   // 防重複第二關:寫入時若撞到唯一約束(同一 message_id),Supabase 會回錯,安靜忽略即可
   await sb("messages", "POST", {
     company_id: shop.company_id,
@@ -213,7 +224,58 @@ async function tryHandleChat(body) {
     customer_message: String(messageText),
     shopee_message_id: messageId ? String(messageId) : null,
     status: "pending",
+    ai_draft: aiDraft || null,
   }).catch(() => {});
+}
+
+// ============================================================
+//  AI 草稿生成(Gemini)
+//  ★ 只生成「草稿」,不會自動送出 — 仍由客服在後台審核/編輯後才核准送出。
+//  ★ 目前還沒接商品/訂單資料,提示詞會請 AI 避免亂編現貨、價格等具體承諾。
+// ============================================================
+async function fetchConversationHistory({ shopId, conversationId, buyerId }) {
+  if (!conversationId && !buyerId) return [];
+  const filter = conversationId
+    ? `conversation_id=eq.${encodeURIComponent(String(conversationId))}`
+    : `buyer_id=eq.${encodeURIComponent(String(buyerId))}`;
+  const rows = await sb(
+    `messages?shop_id=eq.${shopId}&${filter}&select=customer_message,reply_text,received_at&order=received_at.desc&limit=10`
+  ).catch(() => []);
+  return Array.isArray(rows) ? rows.reverse() : []; // 轉回「舊到新」方便組提示詞
+}
+
+async function generateAiDraft({ shopId, conversationId, buyerId, buyerName, messageText }) {
+  if (!GEMINI_API_KEY) return ""; // 沒設金鑰就先不生成
+
+  const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
+  const historyLines = history.flatMap((m) => {
+    const lines = [];
+    if (m.customer_message) lines.push(`客人: ${m.customer_message}`);
+    if (m.reply_text) lines.push(`客服: ${m.reply_text}`);
+    return lines;
+  });
+
+  const prompt = [
+    `你是「${COMPANY_NAME}」蝦皮賣場的客服人員,請用親切、簡潔、口語化的繁體中文回覆買家。`,
+    `注意:`,
+    `- 目前系統還沒有連接商品/庫存/訂單資料,不要編造現貨、價格、出貨日期等具體承諾;若買家問這些,禮貌詢問更多細節(例如商品連結或名稱)。`,
+    `- 這只是「草稿」,會由真人客服審核、視需要修改後才會真正送出,不確定的地方用提問代替武斷回答。`,
+    `- 只要回覆內容本身,不要加任何前綴說明或引號。`,
+    ``,
+    `以下是買家「${buyerName || "買家"}」最近的對話紀錄:`,
+    ...historyLines,
+    `買家最新訊息: ${messageText}`,
+  ].join("\n");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+  });
+  const data = await r.json();
+  const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return draft.trim();
 }
 
 // ============================================================
@@ -226,9 +288,12 @@ async function tryHandleChat(body) {
 //        conversation_id: "...",           ← 哪則對話被回了
 //        content: { conversation_id: "..." }
 //    }
-//  作法:把該對話(同 conversation_id)還「待處理 / 處理中」的訊息,
+//  作法:把該對話(同 conversation_id)還「待處理 / 處理中 / 已核准待自動送出」的訊息,
 //        全部轉成 done,並記註記「已於蝦皮後台回覆」。
 //        (共用蝦皮帳號、分不出是誰回的,依佳芬決定:不分人)
+//  ★ 包含 approved_to_send 很重要:如果客服已經在我們後台核准、但在
+//    自動送出腳本處理之前,又直接在蝦皮後台手動回了,這裡要把那筆
+//    排隊中的項目也標記完成,自動送出腳本才不會再送一次重複訊息。
 // ============================================================
 async function tryHandleReplied(body) {
   const d = body.data || {};
@@ -244,13 +309,13 @@ async function tryHandleReplied(body) {
   if (!shops.length) return;
   const shop = shops[0];
 
-  // 把這個對話裡「還沒完成」的訊息(pending / handling)轉成 done。
+  // 把這個對話裡「還沒完成」的訊息(pending / handling / approved_to_send)轉成 done。
   // 已經是 done 或 auto_sent 的不動。
   const now = new Date().toISOString();
   await sb(
     `messages?shop_id=eq.${shop.id}` +
     `&conversation_id=eq.${encodeURIComponent(String(conversationId))}` +
-    `&status=in.(pending,handling)`,
+    `&status=in.(pending,handling,approved_to_send)`,
     "PATCH",
     { status: "done", reply_text: "(已於蝦皮後台回覆)", handled_at: now }
   ).catch(() => {});
