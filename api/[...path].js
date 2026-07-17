@@ -43,6 +43,15 @@ export default async function handler(req, res) {
     if (path === "/health" || path === "" || path === "/") {
       return text(res, 200, "沐曜客服系統 後端運作中 ✅");
     }
+    // ★ 暫時的診斷端點,查完 GEMINI_API_KEY 問題就會移除,不會回傳金鑰本身內容
+    if (path === "/debug-env") {
+      return json(res, 200, {
+        hasGeminiKey: !!GEMINI_API_KEY,
+        geminiKeyLength: GEMINI_API_KEY.length,
+        geminiKeyPrefix: GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 4) : null,
+        geminiModel: GEMINI_MODEL,
+      });
+    }
     if (path === "/auth-start") return authStart(req, res, base);
     if (path === "/auth-callback") return authCallback(req, res, url);
     if (path === "/shopee-push") return shopeePush(req, res, base);
@@ -274,6 +283,9 @@ async function callGemini(prompt) {
     body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
   });
   const data = await r.json();
+  if (!r.ok || data.error) {
+    console.error("Gemini API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
+  }
   const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   return draft.trim();
 }
