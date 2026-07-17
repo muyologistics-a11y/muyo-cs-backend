@@ -21,9 +21,9 @@ const SHOPEE_HOST = process.env.SHOPEE_HOST || "https://partner.shopeemobile.com
 const SB_URL = process.env.SUPABASE_URL || "";
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const COMPANY_NAME = process.env.COMPANY_NAME || "沐曜實業";
-// Gemini(生成 AI 草稿用);沒設金鑰就跳過生成,不擋收訊流程
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+// OpenAI(生成 AI 草稿用);沒設金鑰就跳過生成,不擋收訊流程
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 // Vercel:不要自動解析 body,我們要原始內容來驗簽章
 export const config = { api: { bodyParser: false } };
@@ -43,13 +43,13 @@ export default async function handler(req, res) {
     if (path === "/health" || path === "" || path === "/") {
       return text(res, 200, "沐曜客服系統 後端運作中 ✅");
     }
-    // ★ 暫時的診斷端點,查完 GEMINI_API_KEY 問題就會移除,不會回傳金鑰本身內容
+    // ★ 暫時的診斷端點,查完 OPENAI_API_KEY 問題就會移除,不會回傳金鑰本身內容
     if (path === "/debug-env") {
       return json(res, 200, {
-        hasGeminiKey: !!GEMINI_API_KEY,
-        geminiKeyLength: GEMINI_API_KEY.length,
-        geminiKeyPrefix: GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 4) : null,
-        geminiModel: GEMINI_MODEL,
+        hasOpenaiKey: !!OPENAI_API_KEY,
+        openaiKeyLength: OPENAI_API_KEY.length,
+        openaiKeyPrefix: OPENAI_API_KEY ? OPENAI_API_KEY.slice(0, 4) : null,
+        openaiModel: OPENAI_MODEL,
       });
     }
     if (path === "/auth-start") return authStart(req, res, base);
@@ -240,7 +240,7 @@ async function tryHandleChat(body) {
 }
 
 // ============================================================
-//  AI 草稿生成(Gemini)
+//  AI 草稿生成(OpenAI)
 //  ★ 只生成「草稿」,不會自動送出 — 仍由客服在後台審核/編輯後才核准送出。
 //  ★ 會參考 faqs 表裡符合的常見問題當作回答依據;沒接的是商品/庫存/訂單
 //    資料,所以提示詞會請 AI 避免亂編現貨、價格等 FAQ 裡也沒有的具體承諾。
@@ -275,23 +275,29 @@ function containsForbiddenWord(text) {
   return FORBIDDEN_WORDS.some((w) => text.includes(w));
 }
 
-async function callGemini(prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+async function callOpenAI(prompt) {
+  const url = "https://api.openai.com/v1/chat/completions";
   const r = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+    }),
   });
   const data = await r.json();
   if (!r.ok || data.error) {
-    console.error("Gemini API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
+    console.error("OpenAI API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
   }
-  const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const draft = data?.choices?.[0]?.message?.content || "";
   return draft.trim();
 }
 
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
-  if (!GEMINI_API_KEY) return ""; // 沒設金鑰就先不生成
+  if (!OPENAI_API_KEY) return ""; // 沒設金鑰就先不生成
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
@@ -325,12 +331,12 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
     `買家最新訊息: ${messageText}`,
   ].join("\n");
 
-  let draft = await callGemini(basePrompt);
+  let draft = await callOpenAI(basePrompt);
 
   if (draft && containsForbiddenWord(draft)) {
     // 出現禁用詞,加強提醒重試一次
     const retryPrompt = `${basePrompt}\n\n★ 你上一次的回覆裡出現了禁用詞「取消」,這是絕對不允許的規則,請重新生成一次完整回覆,全文都不能出現「取消」這兩個字。`;
-    draft = await callGemini(retryPrompt);
+    draft = await callOpenAI(retryPrompt);
   }
 
   if (draft && containsForbiddenWord(draft)) {
