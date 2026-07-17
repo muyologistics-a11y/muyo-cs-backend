@@ -426,8 +426,11 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
 //        conversation_id: "...",           ← 哪則對話被回了
 //        content: { conversation_id: "..." }
 //    }
-//  作法:把該對話(同 conversation_id)還「待處理 / 處理中 / 已核准待自動送出」的訊息,
-//        全部轉成 done,並記註記「已於蝦皮後台回覆」。
+//  作法:把該對話(同 conversation_id)還「待處理 / 處理中」的訊息轉成 done,
+//        並記註記「已於蝦皮後台回覆」;「已核准待自動送出」的訊息也轉成
+//        done,但不覆蓋 reply_text —— 那是核准當下就定案的真正內容,
+//        覆蓋掉會導致自動送出腳本(如果剛好在這個空檔讀到)把佔位文字
+//        當成真的回覆內容送出去,這是踩過的真實地雷,不能再犯。
 //        (共用蝦皮帳號、分不出是誰回的,依佳芬決定:不分人)
 //  ★ 包含 approved_to_send 很重要:如果客服已經在我們後台核准、但在
 //    自動送出腳本處理之前,又直接在蝦皮後台手動回了,這裡要把那筆
@@ -447,16 +450,20 @@ async function tryHandleReplied(body) {
   if (!shops.length) return;
   const shop = shops[0];
 
-  // 把這個對話裡「還沒完成」的訊息(pending / handling / approved_to_send)轉成 done。
-  // 已經是 done 或 auto_sent 的不動。
   const now = new Date().toISOString();
-  await sb(
-    `messages?shop_id=eq.${shop.id}` +
-    `&conversation_id=eq.${encodeURIComponent(String(conversationId))}` +
-    `&status=in.(pending,handling,approved_to_send)`,
-    "PATCH",
-    { status: "done", reply_text: "(已於蝦皮後台回覆)", handled_at: now }
-  ).catch(() => {});
+  const convFilter =
+    `messages?shop_id=eq.${shop.id}&conversation_id=eq.${encodeURIComponent(String(conversationId))}`;
+
+  // 還沒核准過的(pending/handling):本來就沒有真正的回覆內容,轉done時補一個說明性文字沒關係
+  await sb(`${convFilter}&status=in.(pending,handling)`, "PATCH", {
+    status: "done", reply_text: "(已於蝦皮後台回覆)", handled_at: now,
+  }).catch(() => {});
+
+  // 已經核准、reply_text 是真正核准內容的(approved_to_send):只改狀態,
+  // 不要覆蓋 reply_text,保留核准當下真正的內容當作紀錄。
+  await sb(`${convFilter}&status=eq.approved_to_send`, "PATCH", {
+    status: "done", handled_at: now,
+  }).catch(() => {});
 }
 
 // ============================================================
