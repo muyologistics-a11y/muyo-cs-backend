@@ -299,8 +299,16 @@ async function callOpenAI(prompt) {
   }
 }
 
+// 客訴類關鍵字:一律直接用公版頂著、不讓 AI 自己判斷要不要接手 ——
+// 這種情況一定要真人客服處理,不能讓 AI 自己安撫幾句就算了。
+const ESCALATE_KEYWORDS = ["客訴", "投訴", "申訴", "賠償", "求償", "提告", "消保", "消基會", "檢舉", "客服經理"];
+function needsHumanEscalation(text) {
+  return ESCALATE_KEYWORDS.some((w) => text.includes(w));
+}
+
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   if (!OPENAI_API_KEY) return ""; // 沒設金鑰就先不生成
+  if (needsHumanEscalation(messageText)) return FALLBACK_REPLY_TEMPLATE; // 客訴類,不經過AI判斷,直接交給真人
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
