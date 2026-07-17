@@ -24,6 +24,10 @@ const COMPANY_NAME = process.env.COMPANY_NAME || "沐曜實業";
 // OpenAI(生成 AI 草稿用);沒設金鑰就跳過生成,不擋收訊流程
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// FAQ之外/AI判斷自己答不出來/API呼叫技術性失敗時,一律用這段公版頂著,而不是留空白。
+// 想改措辭直接在 Vercel 改這個環境變數就好,不用動程式碼、不用重新部署等太久。
+const FALLBACK_REPLY_TEMPLATE = process.env.FALLBACK_REPLY_TEMPLATE ||
+  "目前為客服休息時間，請耐心等候。\n待客服小編上班時段會盡快協助您處理 🙏";
 
 // Vercel:不要自動解析 body,我們要原始內容來驗簽章
 export const config = { api: { bodyParser: false } };
@@ -266,25 +270,33 @@ function containsForbiddenWord(text) {
   return FORBIDDEN_WORDS.some((w) => text.includes(w));
 }
 
+// 回傳 null 代表「技術性失敗」(API出錯、額度用完、網路問題等),
+// 用來跟「模型就是回了空字串」這種正常情況區分開來,呼叫端才知道要不要頂公版。
 async function callOpenAI(prompt) {
-  const url = "https://api.openai.com/v1/chat/completions";
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  const data = await r.json();
-  if (!r.ok || data.error) {
-    console.error("OpenAI API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
+  try {
+    const url = "https://api.openai.com/v1/chat/completions";
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      console.error("OpenAI API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
+      return null;
+    }
+    const draft = data?.choices?.[0]?.message?.content || "";
+    return draft.trim();
+  } catch (e) {
+    console.error("OpenAI API 呼叫發生例外:", e);
+    return null;
   }
-  const draft = data?.choices?.[0]?.message?.content || "";
-  return draft.trim();
 }
 
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
@@ -312,6 +324,7 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
     `- 目前系統還沒有連接商品/庫存/訂單資料,不要編造現貨、價格、出貨日期等具體承諾(除非 FAQ 裡已經寫明);若買家問這些且 FAQ 沒有答案,禮貌詢問更多細節(例如商品連結或名稱)。`,
     `- 這只是「草稿」,會由真人客服審核、視需要修改後才會真正送出,不確定的地方用提問代替武斷回答。`,
     `- 絕對不能出現「取消」這兩個字,不管什麼情境都不行。如果是講「訂單取消」的情況,一律改講「訂單不成立」;其他情境(活動、優惠等)改用「撤回」「暫停」等其他說法,依情境調整。`,
+    `- 如果買家的問題完全超出你能處理的範圍 —— 不是「可以用禮貌提問釐清」的一般問題,而是真的需要真人客服才能處理(例如複雜客訴、需要查特定訂單細節、牽涉退換貨判斷、或完全看不懂買家在問什麼) —— 不要亂猜答案,請只回覆這串固定文字、一個字都不要改、不要加任何其他內容:「NEED_HUMAN_FALLBACK」`,
     `- 只要回覆內容本身,不要加任何前綴說明或引號。`,
     ``,
     `店家常見問題集(已篩選出符合這次問題的項目):`,
@@ -324,16 +337,24 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
 
   let draft = await callOpenAI(basePrompt);
 
+  // API 技術性失敗(額度用完、網路問題等):用公版頂著,不要留空白給客服自己想
+  if (draft === null) return FALLBACK_REPLY_TEMPLATE;
+
+  // AI 自己判斷答不出來(超出FAQ、需要真人處理):也用公版頂著
+  if (draft.includes("NEED_HUMAN_FALLBACK")) return FALLBACK_REPLY_TEMPLATE;
+
   if (draft && containsForbiddenWord(draft)) {
     // 出現禁用詞,加強提醒重試一次
     const retryPrompt = `${basePrompt}\n\n★ 你上一次的回覆裡出現了禁用詞「取消」,這是絕對不允許的規則,請重新生成一次完整回覆,全文都不能出現「取消」這兩個字。`;
     draft = await callOpenAI(retryPrompt);
+    if (draft === null) return FALLBACK_REPLY_TEMPLATE;
+    if (draft.includes("NEED_HUMAN_FALLBACK")) return FALLBACK_REPLY_TEMPLATE;
   }
 
   if (draft && containsForbiddenWord(draft)) {
-    // 兩次都沒改過來,寧可不提供草稿讓客服自己打,也不要把含禁用詞的內容顯示出來
-    console.warn("generateAiDraft: 重試後仍含禁用詞,回傳空草稿");
-    return "";
+    // 兩次都沒改過來,用公版頂著,也不要把含禁用詞的內容顯示出來
+    console.warn("generateAiDraft: 重試後仍含禁用詞,改用公版回覆");
+    return FALLBACK_REPLY_TEMPLATE;
   }
 
   return draft;
