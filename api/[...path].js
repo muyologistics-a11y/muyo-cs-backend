@@ -21,9 +21,13 @@ const SHOPEE_HOST = process.env.SHOPEE_HOST || "https://partner.shopeemobile.com
 const SB_URL = process.env.SUPABASE_URL || "";
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const COMPANY_NAME = process.env.COMPANY_NAME || "沐曜實業";
-// OpenAI(生成 AI 草稿用);沒設金鑰就跳過生成,不擋收訊流程
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// 預設 AI 設定(當客戶自己沒有在後台填 AI 供應商/金鑰時,退回用這組;
+// 目前主要給我們自己的測試帳號用)。沒設金鑰就跳過生成,不擋收訊流程。
+const DEFAULT_AI_PROVIDER = process.env.OPENAI_API_KEY ? "openai" : "gemini";
+const DEFAULT_OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const DEFAULT_GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 // FAQ之外/AI判斷自己答不出來/API呼叫技術性失敗時,一律用這段公版頂著,而不是留空白。
 // 想改措辭直接在 Vercel 改這個環境變數就好,不用動程式碼、不用重新部署等太久。
 const FALLBACK_REPLY_TEMPLATE = process.env.FALLBACK_REPLY_TEMPLATE ||
@@ -270,19 +274,36 @@ function containsForbiddenWord(text) {
   return FORBIDDEN_WORDS.some((w) => text.includes(w));
 }
 
-// 回傳 null 代表「技術性失敗」(API出錯、額度用完、網路問題等),
-// 用來跟「模型就是回了空字串」這種正常情況區分開來,呼叫端才知道要不要頂公版。
-async function callOpenAI(prompt) {
+// 每個客戶(company)可以在後台自己選 AI 供應商、填自己的金鑰,存在
+// autosend_settings 那一列。沒填的話用我們自己的預設值(給自家測試帳號用)。
+async function fetchAiSettings({ companyId }) {
+  if (!companyId) return null;
+  const rows = await sb(`autosend_settings?company_id=eq.${companyId}&select=ai_provider,ai_api_key,ai_model`).catch(() => []);
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+
+function resolveAiConfig(companySettings) {
+  const provider = companySettings?.ai_provider || DEFAULT_AI_PROVIDER;
+  const isGemini = provider === "gemini";
+  const apiKey = companySettings?.ai_api_key || (isGemini ? DEFAULT_GEMINI_API_KEY : DEFAULT_OPENAI_API_KEY);
+  const model = companySettings?.ai_model || (isGemini ? DEFAULT_GEMINI_MODEL : DEFAULT_OPENAI_MODEL);
+  return { provider, apiKey, model };
+}
+
+// 以下 callOpenAI / callGemini 都回傳 null 代表「技術性失敗」(API出錯、
+// 額度用完、網路問題等),用來跟「模型就是回了空字串」這種正常情況區分開來,
+// 呼叫端才知道要不要頂公版。
+async function callOpenAI(prompt, { apiKey, model }) {
   try {
     const url = "https://api.openai.com/v1/chat/completions";
     const r = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
+        model,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -299,6 +320,31 @@ async function callOpenAI(prompt) {
   }
 }
 
+async function callGemini(prompt, { apiKey, model }) {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      console.error("Gemini API 呼叫失敗:", r.status, JSON.stringify(data.error || data));
+      return null;
+    }
+    const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return draft.trim();
+  } catch (e) {
+    console.error("Gemini API 呼叫發生例外:", e);
+    return null;
+  }
+}
+
+async function callAi(prompt, aiConfig) {
+  return aiConfig.provider === "gemini" ? callGemini(prompt, aiConfig) : callOpenAI(prompt, aiConfig);
+}
+
 // 客訴類關鍵字:一律直接用公版頂著、不讓 AI 自己判斷要不要接手 ——
 // 這種情況一定要真人客服處理,不能讓 AI 自己安撫幾句就算了。
 const ESCALATE_KEYWORDS = ["客訴", "投訴", "申訴", "賠償", "求償", "提告", "消保", "消基會", "檢舉", "客服經理"];
@@ -307,7 +353,9 @@ function needsHumanEscalation(text) {
 }
 
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
-  if (!OPENAI_API_KEY) return ""; // 沒設金鑰就先不生成
+  const companySettings = await fetchAiSettings({ companyId });
+  const aiConfig = resolveAiConfig(companySettings);
+  if (!aiConfig.apiKey) return ""; // 這個客戶沒填金鑰、也沒有預設可退回,先不生成
   if (needsHumanEscalation(messageText)) return FALLBACK_REPLY_TEMPLATE; // 客訴類,不經過AI判斷,直接交給真人
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
@@ -343,7 +391,7 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
     `買家最新訊息: ${messageText}`,
   ].join("\n");
 
-  let draft = await callOpenAI(basePrompt);
+  let draft = await callAi(basePrompt, aiConfig);
 
   // API 技術性失敗(額度用完、網路問題等):用公版頂著,不要留空白給客服自己想
   if (draft === null) return FALLBACK_REPLY_TEMPLATE;
@@ -354,7 +402,7 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
   if (draft && containsForbiddenWord(draft)) {
     // 出現禁用詞,加強提醒重試一次
     const retryPrompt = `${basePrompt}\n\n★ 你上一次的回覆裡出現了禁用詞「取消」,這是絕對不允許的規則,請重新生成一次完整回覆,全文都不能出現「取消」這兩個字。`;
-    draft = await callOpenAI(retryPrompt);
+    draft = await callAi(retryPrompt, aiConfig);
     if (draft === null) return FALLBACK_REPLY_TEMPLATE;
     if (draft.includes("NEED_HUMAN_FALLBACK")) return FALLBACK_REPLY_TEMPLATE;
   }
