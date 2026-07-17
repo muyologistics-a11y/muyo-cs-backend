@@ -206,10 +206,12 @@ async function tryHandleChat(body) {
   if (!shops.length) return;                 // 找不到對應賣場(可能還沒授權)
   const shop = shops[0];
 
-  // 生成 AI 草稿(參考同一段對話的歷史訊息當上下文);失敗也不擋訊息存檔,草稿留空即可
+  // 生成 AI 草稿(參考同一段對話的歷史訊息 + 店家 FAQ 當上下文);失敗也不擋訊息存檔,草稿留空即可
   let aiDraft = "";
   try {
-    aiDraft = await generateAiDraft({ shopId: shop.id, conversationId, buyerId, buyerName, messageText });
+    aiDraft = await generateAiDraft({
+      companyId: shop.company_id, shopId: shop.id, conversationId, buyerId, buyerName, messageText,
+    });
   } catch (e) {
     console.error("generateAiDraft error:", e);
   }
@@ -231,7 +233,8 @@ async function tryHandleChat(body) {
 // ============================================================
 //  AI 草稿生成(Gemini)
 //  ★ 只生成「草稿」,不會自動送出 — 仍由客服在後台審核/編輯後才核准送出。
-//  ★ 目前還沒接商品/訂單資料,提示詞會請 AI 避免亂編現貨、價格等具體承諾。
+//  ★ 會參考 faqs 表裡符合的常見問題當作回答依據;沒接的是商品/庫存/訂單
+//    資料,所以提示詞會請 AI 避免亂編現貨、價格等 FAQ 裡也沒有的具體承諾。
 // ============================================================
 async function fetchConversationHistory({ shopId, conversationId, buyerId }) {
   if (!conversationId && !buyerId) return [];
@@ -244,7 +247,38 @@ async function fetchConversationHistory({ shopId, conversationId, buyerId }) {
   return Array.isArray(rows) ? rows.reverse() : []; // 轉回「舊到新」方便組提示詞
 }
 
-async function generateAiDraft({ shopId, conversationId, buyerId, buyerName, messageText }) {
+// 從店家的 faqs 表裡,找出跟這句買家訊息「關鍵字對得上」的常見問題。
+// faqs.questions 是每個項目自己列的一堆類似問法(例如「運費多少」「免運門檻」…),
+// 用簡單的字串包含比對就好,不需要語意搜尋 —— FAQ 內容本來就是店家自己整理的
+// 關鍵字,對得上代表買家在問同一件事。
+async function fetchRelevantFaqs({ companyId, messageText }) {
+  if (!companyId || !messageText) return [];
+  const rows = await sb(`faqs?company_id=eq.${companyId}&select=category,questions,answer`).catch(() => []);
+  if (!Array.isArray(rows)) return [];
+  const text = String(messageText);
+  return rows.filter((r) => Array.isArray(r.questions) && r.questions.some((q) => q && text.includes(q)));
+}
+
+// 草稿裡絕對不能出現的字(不管什麼情境都不行,例如「取消」— 不分訂單取消、活動取消或其他用法)。
+// 之後如果還有其他禁用詞,加進這個陣列就好。
+const FORBIDDEN_WORDS = ["取消"];
+function containsForbiddenWord(text) {
+  return FORBIDDEN_WORDS.some((w) => text.includes(w));
+}
+
+async function callGemini(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+  });
+  const data = await r.json();
+  const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return draft.trim();
+}
+
+async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   if (!GEMINI_API_KEY) return ""; // 沒設金鑰就先不生成
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
@@ -255,27 +289,45 @@ async function generateAiDraft({ shopId, conversationId, buyerId, buyerName, mes
     return lines;
   });
 
-  const prompt = [
-    `你是「${COMPANY_NAME}」蝦皮賣場的客服人員,請用親切、簡潔、口語化的繁體中文回覆買家。`,
+  const faqs = await fetchRelevantFaqs({ companyId, messageText });
+  const faqBlock = faqs.length
+    ? faqs.map((f) => `【${f.category}】\n建議回覆:${f.answer}`).join("\n\n")
+    : "(沒有找到符合的常見問題,請自行斟酌回答,不確定的地方用提問代替)";
+
+  const basePrompt = [
+    `你是「${COMPANY_NAME}」蝦皮賣場的客服人員,請用親切、簡潔、口語化的繁體中文回覆買家,語氣要像真人客服在打字,不要太工整、太像制式範本。`,
     `注意:`,
-    `- 目前系統還沒有連接商品/庫存/訂單資料,不要編造現貨、價格、出貨日期等具體承諾;若買家問這些,禮貌詢問更多細節(例如商品連結或名稱)。`,
+    `- 可以偶爾自然地加一兩個表情符號(像😊🙏這種常見客服用的),不用每句都加,依內容語氣決定。`,
+    `- 可以偶爾出現很輕微、無傷大雅的打字習慣(像少打標點、口語化的贅字),讓語氣更像真人;但「訂單編號、日期、金額、數量」這類具體數字或事實資訊絕對不能打錯或含糊帶過,錯字只能出現在無關緊要的語氣詞上。`,
+    `- 如果下面「店家常見問題集」裡有符合買家問題的項目,請優先參考裡面的答案內容回覆,事實/政策細節要跟 FAQ 一致(用字可以自然微調,不用整段照抄);沒有符合的項目才自行斟酌回答。`,
+    `- 目前系統還沒有連接商品/庫存/訂單資料,不要編造現貨、價格、出貨日期等具體承諾(除非 FAQ 裡已經寫明);若買家問這些且 FAQ 沒有答案,禮貌詢問更多細節(例如商品連結或名稱)。`,
     `- 這只是「草稿」,會由真人客服審核、視需要修改後才會真正送出,不確定的地方用提問代替武斷回答。`,
+    `- 絕對不能出現「取消」這兩個字,不管什麼情境都不行。如果是講「訂單取消」的情況,一律改講「訂單不成立」;其他情境(活動、優惠等)改用「撤回」「暫停」等其他說法,依情境調整。`,
     `- 只要回覆內容本身,不要加任何前綴說明或引號。`,
+    ``,
+    `店家常見問題集(已篩選出符合這次問題的項目):`,
+    faqBlock,
     ``,
     `以下是買家「${buyerName || "買家"}」最近的對話紀錄:`,
     ...historyLines,
     `買家最新訊息: ${messageText}`,
   ].join("\n");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
-  });
-  const data = await r.json();
-  const draft = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  return draft.trim();
+  let draft = await callGemini(basePrompt);
+
+  if (draft && containsForbiddenWord(draft)) {
+    // 出現禁用詞,加強提醒重試一次
+    const retryPrompt = `${basePrompt}\n\n★ 你上一次的回覆裡出現了禁用詞「取消」,這是絕對不允許的規則,請重新生成一次完整回覆,全文都不能出現「取消」這兩個字。`;
+    draft = await callGemini(retryPrompt);
+  }
+
+  if (draft && containsForbiddenWord(draft)) {
+    // 兩次都沒改過來,寧可不提供草稿讓客服自己打,也不要把含禁用詞的內容顯示出來
+    console.warn("generateAiDraft: 重試後仍含禁用詞,回傳空草稿");
+    return "";
+  }
+
+  return draft;
 }
 
 // ============================================================
