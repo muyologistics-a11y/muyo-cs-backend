@@ -43,15 +43,6 @@ export default async function handler(req, res) {
     if (path === "/health" || path === "" || path === "/") {
       return text(res, 200, "沐曜客服系統 後端運作中 ✅");
     }
-    // ★ 暫時的診斷端點,查完 OPENAI_API_KEY 問題就會移除,不會回傳金鑰本身內容
-    if (path === "/debug-env") {
-      return json(res, 200, {
-        hasOpenaiKey: !!OPENAI_API_KEY,
-        openaiKeyLength: OPENAI_API_KEY.length,
-        openaiKeyPrefix: OPENAI_API_KEY ? OPENAI_API_KEY.slice(0, 4) : null,
-        openaiModel: OPENAI_MODEL,
-      });
-    }
     if (path === "/auth-start") return authStart(req, res, base);
     if (path === "/auth-callback") return authCallback(req, res, url);
     if (path === "/shopee-push") return shopeePush(req, res, base);
