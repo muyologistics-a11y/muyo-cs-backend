@@ -422,6 +422,16 @@ function mentionsInvoice(text) {
   return INVOICE_KEYWORDS.some((w) => text.includes(w));
 }
 
+// 發票對獎中獎通知(每月由客服人工發送)的回覆:客人選「方法1」或「方法2」領獎方式,
+// 措辭不固定,交給真人核對中獎資料處理,AI 不能自己接手。
+// 要求一定要出現「方法」這個詞(才不會誤判到單純講「買1個」「要2件」這種數量的訊息),
+// 但如果客人整句就只回一個字「1」「2」「一」「二」(沒頭沒尾單獨回這樣),也視為在選方法。
+function mentionsLotteryMethod(text) {
+  const trimmed = text.trim();
+  if (/^[12一二]$/.test(trimmed)) return true;
+  return trimmed.includes("方法") && /[12一二]/.test(trimmed);
+}
+
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   const companySettings = await fetchAiSettings({ companyId });
   const aiConfig = resolveAiConfig(companySettings);
@@ -429,6 +439,7 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
   if (needsHumanEscalation(messageText)) return FALLBACK_REPLY_TEMPLATE; // 客訴類,不經過AI判斷,直接交給真人
   if (mentionsTaxId(messageText)) return FALLBACK_REPLY_TEMPLATE; // 已經提供統編,要真的開發票,交給真人
   if (mentionsInvoice(messageText)) return INVOICE_REPLY_TEMPLATE; // 第一次問發票,先回公版問資料
+  if (mentionsLotteryMethod(messageText)) return FALLBACK_REPLY_TEMPLATE; // 發票對獎選領獎方式,交給真人核對
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
