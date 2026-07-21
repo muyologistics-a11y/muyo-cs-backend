@@ -35,6 +35,10 @@ const FALLBACK_REPLY_TEMPLATE = process.env.FALLBACK_REPLY_TEMPLATE ||
 // 電子發票流程專用的「第一次公版」:客人第一次問發票,先回這段請他提供統編等資料。
 const INVOICE_REPLY_TEMPLATE = process.env.INVOICE_REPLY_TEMPLATE ||
   "您好\n我們賣場一般開立 雲端電子發票\n會自動存放在雲端系統網站內唷😊\n\n如需【統編發票】，請在《收到包裹 + 確認商品數量正確.無損》\n於聊聊提供以下資料：\n\n訂單編號：\n抬頭：\n統編：\n電子信箱：\n\n我們將由財務開立後寄送電子檔，方便您列印報帳喔～謝謝您🥰";
+// 商品材質/規格/尺寸問題:第一次先請買家看賣場圖文,同一段對話若再問一次同樣的問題,
+// 代表圖文沒解決他的疑問,改回休息公版交給真人處理。
+const MATERIAL_REPLY_TEMPLATE = process.env.MATERIAL_REPLY_TEMPLATE ||
+  "您好\n商品的材質與參數資訊已整理在賣場圖文中，\n您可以滑到第九張圖查看詳細規格說明唷～\n若有其他想知道的資訊\n可以再聊聊詢問我們 😊";
 
 // Vercel:不要自動解析 body,我們要原始內容來驗簽章
 export const config = { api: { bodyParser: false } };
@@ -453,6 +457,26 @@ function mentionsLotteryMethod(text) {
   return trimmed.includes("方法") && /[12一二]/.test(trimmed);
 }
 
+// 認證類問題(SGS、BSMI等)需要真人實際查證,不能只靠公版打發,直接交給真人。
+const CERT_KEYWORDS = ["認證", "SGS", "BSMI", "BMSI"];
+function mentionsCertification(text) {
+  return CERT_KEYWORDS.some((w) => text.includes(w));
+}
+
+// 商品材質/規格/尺寸問題:資訊已整理在賣場圖文裡,第一次先回公版請買家自己看圖;
+// 同一段對話裡如果再問一次,代表圖文沒解決疑問,改回休息公版讓真人接手,不要一直重複貼公版。
+const MATERIAL_KEYWORDS = ["材質", "成分", "規格", "參數", "尺寸", "高度", "寬度", "厚度"];
+function mentionsMaterial(text) {
+  return MATERIAL_KEYWORDS.some((w) => text.includes(w));
+}
+async function hasSentMaterialReplyBefore(shopId, conversationId) {
+  if (!conversationId) return false;
+  const rows = await sb(
+    `messages?shop_id=eq.${shopId}&conversation_id=eq.${encodeURIComponent(String(conversationId))}&ai_draft=eq.${encodeURIComponent(MATERIAL_REPLY_TEMPLATE)}&select=id&limit=1`
+  ).catch(() => []);
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   const companySettings = await fetchAiSettings({ companyId });
   const aiConfig = resolveAiConfig(companySettings);
@@ -461,6 +485,11 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
   if (mentionsTaxId(messageText)) return FALLBACK_REPLY_TEMPLATE; // 已經提供統編,要真的開發票,交給真人
   if (mentionsInvoice(messageText)) return INVOICE_REPLY_TEMPLATE; // 第一次問發票,先回公版問資料
   if (mentionsLotteryMethod(messageText)) return FALLBACK_REPLY_TEMPLATE; // 發票對獎選領獎方式,交給真人核對
+  if (mentionsCertification(messageText)) return FALLBACK_REPLY_TEMPLATE; // 認證類問題需真人查證
+  if (mentionsMaterial(messageText)) {
+    const alreadySent = await hasSentMaterialReplyBefore(shopId, conversationId);
+    return alreadySent ? FALLBACK_REPLY_TEMPLATE : MATERIAL_REPLY_TEMPLATE; // 第二次再問同樣的問題才交給真人
+  }
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
