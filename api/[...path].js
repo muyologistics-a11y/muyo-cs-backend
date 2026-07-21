@@ -204,6 +204,7 @@ async function tryHandleChat(body) {
   const buyerName = c.from_user_name || null;
   const conversationId = c.conversation_id || null;
   const messageId = c.message_id || d.message_id || null;   // 訊息唯一編號
+  const itemId = c.source_content?.item_id || null;         // 客人詢問時所在的商品(蝦皮才有帶)
 
   if (!shopId || !messageText) return;       // 抓不到就略過(已記在 push_logs)
 
@@ -213,7 +214,7 @@ async function tryHandleChat(body) {
     if (Array.isArray(dup) && dup.length) return;  // 已經有了 → 跳過,不重複寫
   }
 
-  const shops = await sb(`shops?shopee_shop_id=eq.${shopId}&select=id,company_id`);
+  const shops = await sb(`shops?shopee_shop_id=eq.${shopId}&select=id,company_id,shopee_shop_id,access_token,refresh_token,token_expire_at`);
   if (!shops.length) return;                 // 找不到對應賣場(可能還沒授權)
   const shop = shops[0];
 
@@ -227,6 +228,16 @@ async function tryHandleChat(body) {
     console.error("generateAiDraft error:", e);
   }
 
+  // 查詢商品名稱(先查快取,沒有才呼叫蝦皮商品 API);查不到也不擋訊息存檔
+  let itemName = null;
+  if (itemId) {
+    try {
+      itemName = await resolveItemName(shop, itemId);
+    } catch (e) {
+      console.error("resolveItemName error:", e);
+    }
+  }
+
   // 防重複第二關:寫入時若撞到唯一約束(同一 message_id),Supabase 會回錯,安靜忽略即可
   await sb("messages", "POST", {
     company_id: shop.company_id,
@@ -236,9 +247,45 @@ async function tryHandleChat(body) {
     buyer_name: buyerName || null,
     customer_message: String(messageText),
     shopee_message_id: messageId ? String(messageId) : null,
+    item_id: itemId ? String(itemId) : null,
+    item_name: itemName || null,
     status: "pending",
     ai_draft: aiDraft || null,
   }).catch(() => {});
+}
+
+// ============================================================
+//  查詢商品名稱:先查 item_cache,沒有才呼叫蝦皮商品 API 換回名稱並存快取。
+//  ★ 需要蝦皮開發者後台的「商品」API 權限;若沒開通,呼叫會失敗,
+//    此時安靜回傳 null,不影響訊息正常存檔(只是沒有商品名稱可顯示)。
+// ============================================================
+async function resolveItemName(shop, itemId) {
+  const cached = await sb(`item_cache?shop_id=eq.${shop.id}&item_id=eq.${encodeURIComponent(String(itemId))}&select=item_name`);
+  if (Array.isArray(cached) && cached.length) return cached[0].item_name;
+
+  const freshShop = await ensureFreshToken(shop);
+  if (!freshShop.access_token) return null;
+
+  const path = "/api/v2/product/get_item_base_info";
+  const ts = Math.floor(Date.now() / 1000);
+  const sign = signShop(path, ts, freshShop.access_token, Number(freshShop.shopee_shop_id));
+  const url = `${SHOPEE_HOST}${path}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${freshShop.access_token}&shop_id=${freshShop.shopee_shop_id}&item_id_list=${encodeURIComponent(String(itemId))}`;
+
+  const r = await fetch(url);
+  const data = await r.json();
+  if (data.error) {
+    console.error("get_item_base_info error:", data.error, data.message);
+    return null;
+  }
+  const itemName = data?.response?.item_list?.[0]?.item_name || null;
+
+  // 存進快取(就算查到的是 null 也不快取,下次還會再試一次)
+  if (itemName) {
+    await sb("item_cache", "POST", {
+      shop_id: shop.id, item_id: String(itemId), item_name: itemName,
+    }).catch(() => {});
+  }
+  return itemName;
 }
 
 // ============================================================
