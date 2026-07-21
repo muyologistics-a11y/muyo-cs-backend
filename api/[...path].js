@@ -242,6 +242,18 @@ async function tryHandleChat(body) {
     }
   }
 
+  // 全自動回覆:公司自己在後台開啟後,有生成內容(不管是AI真的回答、還是公版)就直接
+  // 排入自動送出,不用人工核准。沒有草稿(例如買家自動回覆、AI技術性失敗留空)則不受影響,
+  // 照樣走 pending 待人工處理。
+  let fullAutoOn = false;
+  if (aiDraft) {
+    try {
+      fullAutoOn = await isFullAutoEnabled(shop.company_id);
+    } catch (e) {
+      console.error("isFullAutoEnabled error:", e);
+    }
+  }
+
   // 防重複第二關:寫入時若撞到唯一約束(同一 message_id),Supabase 會回錯,安靜忽略即可
   await sb("messages", "POST", {
     company_id: shop.company_id,
@@ -254,7 +266,8 @@ async function tryHandleChat(body) {
     item_id: itemId ? String(itemId) : null,
     item_name: itemName || null,
     is_auto_reply: isAutoReply,
-    status: "pending",
+    status: fullAutoOn ? "approved_to_send" : "pending",
+    reply_text: fullAutoOn ? aiDraft : null,
     ai_draft: aiDraft || null,
   }).catch(() => {});
 }
@@ -335,6 +348,13 @@ async function fetchAiSettings({ companyId }) {
   if (!companyId) return null;
   const rows = await sb(`autosend_settings?company_id=eq.${companyId}&select=ai_provider,ai_api_key,ai_model`).catch(() => []);
   return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+
+// 全自動回覆開關:預設關閉,公司要自己在後台打開才會生效。
+async function isFullAutoEnabled(companyId) {
+  if (!companyId) return false;
+  const rows = await sb(`autosend_settings?company_id=eq.${companyId}&select=full_auto_enabled`).catch(() => []);
+  return !!(Array.isArray(rows) && rows[0] && rows[0].full_auto_enabled);
 }
 
 function resolveAiConfig(companySettings) {
