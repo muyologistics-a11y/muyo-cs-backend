@@ -540,9 +540,9 @@ async function tryHandleReplied(body) {
 
   // 防呆:賣場自己在蝦皮後台開的「自動回覆」(跟我們的AI系統無關的原生功能)一觸發,
   // 蝦皮就會立刻推「已回覆」通知過來,但其實沒有真人/AI真的處理過內容。
-  // 真人不可能在 20 秒內看懂問題又打完字回覆,太快一定是自動回覆誤觸發——
+  // 真人不可能在 1 分鐘內看懂問題又打完字回覆,太快一定是自動回覆誤觸發——
   // 這種情況不標記完成,讓訊息繼續留在待處理,真人才看得到。
-  const AUTO_REPLY_GUARD_SECONDS = 20;
+  const AUTO_REPLY_GUARD_SECONDS = 60;
   const latestMsg = await sb(`${convFilter}&select=received_at&order=received_at.desc&limit=1`);
   if (latestMsg.length) {
     const gapSeconds = (Date.now() - new Date(latestMsg[0].received_at).getTime()) / 1000;
