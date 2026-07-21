@@ -58,7 +58,6 @@ export default async function handler(req, res) {
     if (path === "/auth-callback") return authCallback(req, res, url);
     if (path === "/shopee-push") return shopeePush(req, res, base);
     if (path === "/send-reply") return sendReply(req, res);
-    if (path === "/debug-item-name") return debugItemName(req, res, url);
 
     return text(res, 404, "Not found");
   } catch (e) {
@@ -260,23 +259,6 @@ async function tryHandleChat(body) {
 //  ★ 需要蝦皮開發者後台的「商品」API 權限;若沒開通,呼叫會失敗,
 //    此時安靜回傳 null,不影響訊息正常存檔(只是沒有商品名稱可顯示)。
 // ============================================================
-// ★ 暫時的除錯端點,測試完蝦皮商品 API 權限後就會移除。
-async function debugItemName(req, res, url) {
-  const shopeeShopId = url.searchParams.get("shop_id");
-  const itemId = url.searchParams.get("item_id");
-  if (!shopeeShopId || !itemId) return json(res, 400, { ok: false, error: "缺少 shop_id 或 item_id" });
-
-  const shops = await sb(`shops?shopee_shop_id=eq.${shopeeShopId}&select=id,shopee_shop_id,access_token,refresh_token,token_expire_at`);
-  if (!shops.length) return json(res, 404, { ok: false, error: "找不到這個賣場" });
-
-  try {
-    const itemName = await resolveItemName(shops[0], itemId);
-    return json(res, 200, { ok: true, itemName });
-  } catch (e) {
-    return json(res, 500, { ok: false, error: String(e.message || e) });
-  }
-}
-
 async function resolveItemName(shop, itemId) {
   const cached = await sb(`item_cache?shop_id=eq.${shop.id}&item_id=eq.${encodeURIComponent(String(itemId))}&select=item_name`);
   if (Array.isArray(cached) && cached.length) return cached[0].item_name;
