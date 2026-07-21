@@ -355,14 +355,17 @@ function needsHumanEscalation(text) {
   return ESCALATE_KEYWORDS.some((w) => text.includes(w));
 }
 
-// 電子發票流程:客人一旦提到「統編」,代表要真的開立發票了(需要真人去財務系統
-// 實際操作),不能讓 AI 隨口答應,直接交給真人;還沒到這步、只是單純問發票/
-// 三聯式的,先回固定公版請他提供統編等資料。★ 統編判斷要放在發票關鍵字判斷「前面」,
-// 這樣如果客人一次就把統編等資料都打出來,會直接跳過問資料那步、直接轉真人。
-const TAX_ID_KEYWORDS = ["統編"];
+// 電子發票流程:客人真的給了統編「號碼」,代表要真的開立發票了(需要真人去財務
+// 系統實際操作),不能讓 AI 隨口答應,直接交給真人;還沒到這步、只是單純問發票/
+// 三聯式/有沒有統編發票的,先回固定公版請他提供統編等資料。
+// ★ 統編是台灣的8碼數字,一定要「統編」這個詞 + 真的出現8碼數字才算,單純講
+// 「統編發票」「有統編嗎」這種問法(沒有實際號碼)不算,不然會誤判跳過問資料那步。
+const TAX_ID_KEYWORDS = ["統編", "統一編號"];
 const INVOICE_KEYWORDS = ["發票", "電子發票", "三聯式"];
 function mentionsTaxId(text) {
-  return TAX_ID_KEYWORDS.some((w) => text.includes(w));
+  const hasTaxIdWord = TAX_ID_KEYWORDS.some((w) => text.includes(w));
+  const hasEightDigits = /\d{8}/.test(text);
+  return hasTaxIdWord && hasEightDigits;
 }
 function mentionsInvoice(text) {
   return INVOICE_KEYWORDS.some((w) => text.includes(w));
