@@ -32,6 +32,9 @@ const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 // 想改措辭直接在 Vercel 改這個環境變數就好,不用動程式碼、不用重新部署等太久。
 const FALLBACK_REPLY_TEMPLATE = process.env.FALLBACK_REPLY_TEMPLATE ||
   "目前為客服休息時間，請耐心等候。\n待客服小編上班時段會盡快協助您處理 🙏";
+// 電子發票流程專用的「第一次公版」:客人第一次問發票,先回這段請他提供統編等資料。
+const INVOICE_REPLY_TEMPLATE = process.env.INVOICE_REPLY_TEMPLATE ||
+  "您好\n我們賣場一般開立 雲端電子發票\n會自動存放在雲端系統網站內唷😊\n\n如需【統編發票】，請在《收到包裹 + 確認商品數量正確.無損》\n於聊聊提供以下資料：\n\n訂單編號：\n抬頭：\n統編：\n電子信箱：\n\n我們將由財務開立後寄送電子檔，方便您列印報帳喔～謝謝您🥰";
 
 // Vercel:不要自動解析 body,我們要原始內容來驗簽章
 export const config = { api: { bodyParser: false } };
@@ -352,11 +355,26 @@ function needsHumanEscalation(text) {
   return ESCALATE_KEYWORDS.some((w) => text.includes(w));
 }
 
+// 電子發票流程:客人一旦提到「統編」,代表要真的開立發票了(需要真人去財務系統
+// 實際操作),不能讓 AI 隨口答應,直接交給真人;還沒到這步、只是單純問發票/
+// 三聯式的,先回固定公版請他提供統編等資料。★ 統編判斷要放在發票關鍵字判斷「前面」,
+// 這樣如果客人一次就把統編等資料都打出來,會直接跳過問資料那步、直接轉真人。
+const TAX_ID_KEYWORDS = ["統編"];
+const INVOICE_KEYWORDS = ["發票", "電子發票", "三聯式"];
+function mentionsTaxId(text) {
+  return TAX_ID_KEYWORDS.some((w) => text.includes(w));
+}
+function mentionsInvoice(text) {
+  return INVOICE_KEYWORDS.some((w) => text.includes(w));
+}
+
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   const companySettings = await fetchAiSettings({ companyId });
   const aiConfig = resolveAiConfig(companySettings);
   if (!aiConfig.apiKey) return ""; // 這個客戶沒填金鑰、也沒有預設可退回,先不生成
   if (needsHumanEscalation(messageText)) return FALLBACK_REPLY_TEMPLATE; // 客訴類,不經過AI判斷,直接交給真人
+  if (mentionsTaxId(messageText)) return FALLBACK_REPLY_TEMPLATE; // 已經提供統編,要真的開發票,交給真人
+  if (mentionsInvoice(messageText)) return INVOICE_REPLY_TEMPLATE; // 第一次問發票,先回公版問資料
 
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
