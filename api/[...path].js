@@ -205,6 +205,7 @@ async function tryHandleChat(body) {
   const conversationId = c.conversation_id || null;
   const messageId = c.message_id || d.message_id || null;   // 訊息唯一編號
   const itemId = c.source_content?.item_id || null;         // 客人詢問時所在的商品(蝦皮才有帶)
+  const isAutoReply = c.status === "auto_reply";            // 買家自己設定的「不在時自動回覆」,不是真人打的
 
   if (!shopId || !messageText) return;       // 抓不到就略過(已記在 push_logs)
 
@@ -219,13 +220,16 @@ async function tryHandleChat(body) {
   const shop = shops[0];
 
   // 生成 AI 草稿(參考同一段對話的歷史訊息 + 店家 FAQ 當上下文);失敗也不擋訊息存檔,草稿留空即可
+  // 買家自己的「自動回覆」不是真的問題,不用浪費 AI 呼叫去回答它,草稿留空讓客服自己判斷要不要理會。
   let aiDraft = "";
-  try {
-    aiDraft = await generateAiDraft({
-      companyId: shop.company_id, shopId: shop.id, conversationId, buyerId, buyerName, messageText,
-    });
-  } catch (e) {
-    console.error("generateAiDraft error:", e);
+  if (!isAutoReply) {
+    try {
+      aiDraft = await generateAiDraft({
+        companyId: shop.company_id, shopId: shop.id, conversationId, buyerId, buyerName, messageText,
+      });
+    } catch (e) {
+      console.error("generateAiDraft error:", e);
+    }
   }
 
   // 查詢商品名稱(先查快取,沒有才呼叫蝦皮商品 API);查不到也不擋訊息存檔
