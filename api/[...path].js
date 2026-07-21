@@ -538,6 +538,17 @@ async function tryHandleReplied(body) {
   const convFilter =
     `messages?shop_id=eq.${shop.id}&conversation_id=eq.${encodeURIComponent(String(conversationId))}`;
 
+  // 防呆:賣場自己在蝦皮後台開的「自動回覆」(跟我們的AI系統無關的原生功能)一觸發,
+  // 蝦皮就會立刻推「已回覆」通知過來,但其實沒有真人/AI真的處理過內容。
+  // 真人不可能在 20 秒內看懂問題又打完字回覆,太快一定是自動回覆誤觸發——
+  // 這種情況不標記完成,讓訊息繼續留在待處理,真人才看得到。
+  const AUTO_REPLY_GUARD_SECONDS = 20;
+  const latestMsg = await sb(`${convFilter}&select=received_at&order=received_at.desc&limit=1`);
+  if (latestMsg.length) {
+    const gapSeconds = (Date.now() - new Date(latestMsg[0].received_at).getTime()) / 1000;
+    if (gapSeconds < AUTO_REPLY_GUARD_SECONDS) return; // 太快了,疑似賣場自動回覆誤觸發,略過
+  }
+
   // 還沒核准過的(pending/handling):本來就沒有真正的回覆內容,轉done時補一個說明性文字沒關係
   await sb(`${convFilter}&status=in.(pending,handling)`, "PATCH", {
     status: "done", reply_text: "(已於蝦皮後台回覆)", handled_at: now,
