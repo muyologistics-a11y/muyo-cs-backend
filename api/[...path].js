@@ -253,6 +253,7 @@ async function tryHandleChat(body) {
     shopee_message_id: messageId ? String(messageId) : null,
     item_id: itemId ? String(itemId) : null,
     item_name: itemName || null,
+    is_auto_reply: isAutoReply,
     status: "pending",
     ai_draft: aiDraft || null,
   }).catch(() => {});
