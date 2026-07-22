@@ -203,7 +203,8 @@ async function tryHandleChat(body) {
   const c = d.content || {};                 // 訊息主體都在 data.content 底下
 
   const shopId = c.to_shop_id || body.shop_id || d.shop_id || null;
-  const messageText = c.content?.text || c.text || null;
+  const isSticker = c.message_type === "sticker" || !!c.content?.sticker_id; // 貼圖沒有文字內容,蝦皮只會帶 sticker_id
+  const messageText = c.content?.text || c.text || (isSticker ? "[貼圖]" : null);
   const buyerId = c.from_id || null;
   const buyerName = c.from_user_name || null;
   const conversationId = c.conversation_id || null;
@@ -224,9 +225,9 @@ async function tryHandleChat(body) {
   const shop = shops[0];
 
   // 生成 AI 草稿(參考同一段對話的歷史訊息 + 店家 FAQ 當上下文);失敗也不擋訊息存檔,草稿留空即可
-  // 買家自己的「自動回覆」不是真的問題,不用浪費 AI 呼叫去回答它,草稿留空讓客服自己判斷要不要理會。
+  // 買家自己的「自動回覆」、單純傳貼圖,都不是真的問題,不用浪費 AI 呼叫去回答,草稿留空讓客服自己判斷。
   let aiDraft = "";
-  if (!isAutoReply) {
+  if (!isAutoReply && !isSticker) {
     try {
       aiDraft = await generateAiDraft({
         companyId: shop.company_id, shopId: shop.id, conversationId, buyerId, buyerName, messageText,
