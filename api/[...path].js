@@ -18,6 +18,10 @@ const PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY || "";
 // 蝦皮「推送」用的驗證金鑰(Set Push 頁 Generate 的那組);沒設就退回用 PARTNER_KEY
 const PUSH_KEY = process.env.SHOPEE_PUSH_KEY || process.env.SHOPEE_PARTNER_KEY || "";
 const SHOPEE_HOST = process.env.SHOPEE_HOST || "https://partner.shopeemobile.com";
+// 蝦皮送訊 API 沒帶 region 會回 not_open_market;目前只服務台灣賣場,沒特別指定就用 TW。
+const DEFAULT_REGION = process.env.SHOPEE_REGION || "TW";
+// 排程觸發端點(/auto-send-tick)的密鑰,只有帶對密鑰的呼叫才會真的執行送出動作。
+const AUTO_SEND_TICK_SECRET = process.env.AUTO_SEND_TICK_SECRET || "";
 const SB_URL = process.env.SUPABASE_URL || "";
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const COMPANY_NAME = process.env.COMPANY_NAME || "沐曜實業";
@@ -62,6 +66,7 @@ export default async function handler(req, res) {
     if (path === "/auth-callback") return authCallback(req, res, url);
     if (path === "/shopee-push") return shopeePush(req, res, base);
     if (path === "/send-reply") return sendReply(req, res);
+    if (path === "/auto-send-tick") return autoSendTick(req, res);
 
     return text(res, 404, "Not found");
   } catch (e) {
@@ -247,15 +252,18 @@ async function tryHandleChat(body) {
     }
   }
 
-  // 全自動回覆:公司自己在後台開啟後,有生成內容(不管是AI真的回答、還是公版)就直接
-  // 排入自動送出,不用人工核准。沒有草稿(例如買家自動回覆、AI技術性失敗留空)則不受影響,
-  // 照樣走 pending 待人工處理。
+  // 全自動回覆:公司自己在後台開啟後,「而且現在在排程時段內(平日晚上/假日,依佳芬
+  // 要求:白天客服在的時段還是要人工審核,只有沒人顧的晚上/假日才真的全自動)」,
+  // 有生成內容(不管是AI真的回答、還是公版)就直接排入自動送出,不用人工核准。
+  // 時段外(或手動暫停)一律照樣走 pending 待人工處理,不受這個開關影響。
+  // 沒有草稿(例如買家自動回覆、AI技術性失敗留空)也不受影響,照樣走 pending。
   let fullAutoOn = false;
   if (aiDraft) {
     try {
-      fullAutoOn = await isFullAutoEnabled(shop.company_id);
+      const settings = await fetchAutosendSettings(shop.company_id);
+      fullAutoOn = !!settings?.full_auto_enabled && isWithinSchedule(settings);
     } catch (e) {
-      console.error("isFullAutoEnabled error:", e);
+      console.error("fetchAutosendSettings error:", e);
     }
   }
 
@@ -355,11 +363,40 @@ async function fetchAiSettings({ companyId }) {
   return Array.isArray(rows) && rows[0] ? rows[0] : null;
 }
 
-// 全自動回覆開關:預設關閉,公司要自己在後台打開才會生效。
-async function isFullAutoEnabled(companyId) {
-  if (!companyId) return false;
-  const rows = await sb(`autosend_settings?company_id=eq.${companyId}&select=full_auto_enabled`).catch(() => []);
-  return !!(Array.isArray(rows) && rows[0] && rows[0].full_auto_enabled);
+// 自動送出排程設定(平日/假日時段、全自動開關、緊急暫停)整包撈出來,
+// 給「全自動回覆該不該跳過人工審核」跟「/auto-send-tick 該不該真的送出」共用判斷。
+async function fetchAutosendSettings(companyId) {
+  if (!companyId) return null;
+  const rows = await sb(
+    `autosend_settings?company_id=eq.${companyId}&select=id,full_auto_enabled,weekday_start,weekday_end,weekend_active,manual_pause,last_heartbeat_at`
+  ).catch(() => []);
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+
+// Vercel 伺服器預設是 UTC 時區,不能直接用 new Date().getHours() 判斷「現在台灣幾點」,
+// 這裡用 Intl.DateTimeFormat 轉成 Asia/Taipei 的星期/時/分,跟前端(瀏覽器本來就在台灣時區)判斷邏輯對齊。
+function taipeiNow() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Taipei", hour12: false,
+    weekday: "short", hour: "2-digit", minute: "2-digit",
+  }).formatToParts(new Date());
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return { day: weekdayMap[get("weekday")], hour: Number(get("hour")), minute: Number(get("minute")) };
+}
+
+// ★ 這裡的判斷邏輯要跟前端 index.html 裡的 isWithinSchedule 保持一致。
+function isWithinSchedule(s, now) {
+  now = now || taipeiNow();
+  if (!s) return true;
+  if (s.manual_pause) return false;
+  if (now.day === 0 || now.day === 6) return !!s.weekend_active;
+  const toMin = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
+  const cur = now.hour * 60 + now.minute;
+  const start = toMin(s.weekday_start), end = toMin(s.weekday_end);
+  if (start === end) return true;
+  if (start < end) return cur >= start && cur < end;
+  return cur >= start || cur < end;
 }
 
 function resolveAiConfig(companySettings) {
@@ -639,7 +676,16 @@ async function sendReply(req, res) {
   }
   if (!shop.access_token) return json(res, 400, { ok: false, error: "這個賣場沒有 access_token,請重新授權" });
 
-  // 呼叫蝦皮送訊 API
+  const result = await sendToShopee(shop, { message, to_id, conversation_id, region });
+  if (!result.ok) return json(res, 200, result);
+  return json(res, 200, result);
+}
+
+// ============================================================
+//  真正呼叫蝦皮送訊 API(供 /send-reply 人工送出、/auto-send-tick 全自動送出共用)
+//  ★ 呼叫前 shop 一定要是已經 ensureFreshToken 過、access_token 有效的版本。
+// ============================================================
+async function sendToShopee(shop, { message, to_id, conversation_id, region }) {
   const apiPath = "/api/v2/sellerchat/send_message";
   const ts = Math.floor(Date.now() / 1000);
   const sign = signShop(apiPath, ts, shop.access_token, Number(shop.shopee_shop_id));
@@ -649,7 +695,7 @@ async function sendReply(req, res) {
   const bodyObj = { message_type: "text", content: { text: String(message) } };
   if (to_id) bodyObj.to_id = Number(to_id);
   else if (conversation_id) bodyObj.conversation_id = String(conversation_id);
-  if (region) bodyObj.region = String(region);
+  bodyObj.region = String(region || DEFAULT_REGION);
 
   let data = {};
   try {
@@ -660,14 +706,73 @@ async function sendReply(req, res) {
     });
     data = await r.json();
   } catch (e) {
-    return json(res, 502, { ok: false, error: "呼叫蝦皮送訊失敗:" + String(e.message || e) });
+    return { ok: false, error: "呼叫蝦皮送訊失敗:" + String(e.message || e) };
   }
 
   // 蝦皮回應:error 為空字串代表成功
   if (data.error) {
-    return json(res, 200, { ok: false, error: data.error, message: data.message || "", shopee: data });
+    return { ok: false, error: data.error, message: data.message || "", shopee: data };
   }
-  return json(res, 200, { ok: true, shopee: data });
+  return { ok: true, shopee: data };
+}
+
+// ============================================================
+//  排程觸發端點:給外部免費排程服務(如 cron-job.org)每隔幾分鐘呼叫一次,
+//  取代原本「跑在某台電腦上的自動化腳本」。
+//  ★ 只處理「全自動回覆」產生、沒有人認領的訊息(handler_id is null)——
+//    客服手動核准的訊息現在是前端直接呼叫 /send-reply 立刻送出,不會卡在
+//    approved_to_send 這個狀態等這支排程來處理,兩條路互不干擾。
+//  流程:
+//    1. 先更新心跳時間(不管有沒有東西要送,證明這支排程本身還活著,
+//       後台的「🟢自動送出運作中/🟡沒回應」燈號就是看這個時間)
+//    2. 不在排程時段內(或手動暫停):把卡住的全自動訊息退回 pending,
+//       讓客服在正常上班時間還是看得到、能自己接手,不會被晾在旁邊沒人管
+//    3. 在時段內:一次只挑最舊的一筆送出(不要一次全部噴光,維持節奏分散、
+//       不要一次大量送出看起來像機器人),送成功才轉 auto_sent
+// ============================================================
+async function autoSendTick(req, res) {
+  const url = new URL(req.url, "http://x");
+  const provided = (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("key") || "";
+  if (!AUTO_SEND_TICK_SECRET || provided !== AUTO_SEND_TICK_SECRET) {
+    return json(res, 401, { ok: false, error: "密鑰錯誤或未設定 AUTO_SEND_TICK_SECRET" });
+  }
+
+  const companyId = await sbGetCompanyId();
+  const settings = await fetchAutosendSettings(companyId);
+  if (!settings) return json(res, 200, { ok: true, note: "尚未設定 autosend_settings,略過" });
+
+  await sb(`autosend_settings?id=eq.${settings.id}`, "PATCH", { last_heartbeat_at: new Date().toISOString() }).catch(() => {});
+
+  if (!isWithinSchedule(settings)) {
+    await sb(
+      `messages?company_id=eq.${companyId}&status=eq.approved_to_send&handler_id=is.null`,
+      "PATCH", { status: "pending" }
+    ).catch(() => {});
+    return json(res, 200, { ok: true, note: "不在排程時段內,已退回待處理" });
+  }
+
+  const queued = await sb(
+    `messages?company_id=eq.${companyId}&status=eq.approved_to_send&handler_id=is.null&select=id,shop_id,conversation_id,buyer_id,reply_text&order=received_at.asc&limit=1`
+  ).catch(() => []);
+  if (!Array.isArray(queued) || !queued.length) return json(res, 200, { ok: true, note: "沒有排隊中的訊息" });
+  const msg = queued[0];
+
+  const shops = await sb(`shops?id=eq.${msg.shop_id}&select=id,shopee_shop_id,access_token,refresh_token,token_expire_at`);
+  if (!shops.length) return json(res, 200, { ok: false, error: "找不到對應賣場" });
+  let shop = shops[0];
+  try {
+    shop = await ensureFreshToken(shop);
+  } catch (e) {
+    return json(res, 200, { ok: false, error: "換取新 token 失敗:" + String(e.message || e) });
+  }
+
+  const result = await sendToShopee(shop, {
+    message: msg.reply_text, to_id: msg.buyer_id, conversation_id: msg.conversation_id,
+  });
+  if (result.ok) {
+    await sb(`messages?id=eq.${msg.id}`, "PATCH", { status: "auto_sent", handled_at: new Date().toISOString() }).catch(() => {});
+  }
+  return json(res, 200, { ok: result.ok, messageId: msg.id, detail: result });
 }
 
 // token 若已過期(或快過期),用 refresh_token 換新的,並存回 shops
