@@ -67,6 +67,7 @@ export default async function handler(req, res) {
     if (path === "/shopee-push") return shopeePush(req, res, base);
     if (path === "/send-reply") return sendReply(req, res);
     if (path === "/auto-send-tick") return autoSendTick(req, res);
+    if (path === "/debug-shop-info") return debugShopInfo(req, res, url);
 
     return text(res, 404, "Not found");
   } catch (e) {
@@ -773,6 +774,41 @@ async function autoSendTick(req, res) {
     await sb(`messages?id=eq.${msg.id}`, "PATCH", { status: "auto_sent", handled_at: new Date().toISOString() }).catch(() => {});
   }
   return json(res, 200, { ok: result.ok, messageId: msg.id, detail: result });
+}
+
+// ============================================================
+//  【暫時】除錯端點:查詢賣場在蝦皮官方認定的 region,排查 sellerchat/send_message
+//  一直回 not_open_market 的問題是不是 region 填錯造成的。查完就會移除,不留在正式程式碼裡。
+//  沿用 AUTO_SEND_TICK_SECRET 當密鑰,不用另外設新的環境變數。
+// ============================================================
+async function debugShopInfo(req, res, url) {
+  const provided = (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("key") || "";
+  if (!AUTO_SEND_TICK_SECRET || provided !== AUTO_SEND_TICK_SECRET) {
+    return json(res, 401, { ok: false, error: "密鑰錯誤" });
+  }
+
+  const shops = await sb(`shops?select=id,shopee_shop_id,access_token,refresh_token,token_expire_at&limit=1`);
+  if (!shops.length) return json(res, 404, { ok: false, error: "找不到賣場" });
+  let shop = shops[0];
+  try {
+    shop = await ensureFreshToken(shop);
+  } catch (e) {
+    return json(res, 500, { ok: false, error: "換取新 token 失敗:" + String(e.message || e) });
+  }
+
+  const apiPath = "/api/v2/shop/get_shop_info";
+  const ts = Math.floor(Date.now() / 1000);
+  const sign = signShop(apiPath, ts, shop.access_token, Number(shop.shopee_shop_id));
+  const apiUrl = `${SHOPEE_HOST}${apiPath}?partner_id=${PARTNER_ID}&timestamp=${ts}&sign=${sign}&access_token=${shop.access_token}&shop_id=${shop.shopee_shop_id}`;
+
+  let data = {};
+  try {
+    const r = await fetch(apiUrl);
+    data = await r.json();
+  } catch (e) {
+    return json(res, 502, { ok: false, error: "呼叫蝦皮失敗:" + String(e.message || e) });
+  }
+  return json(res, 200, { ok: true, shopee_shop_id: shop.shopee_shop_id, data });
 }
 
 // token 若已過期(或快過期),用 refresh_token 換新的,並存回 shops
