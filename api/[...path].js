@@ -545,8 +545,10 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
   const basePrompt = [
     `你是「${COMPANY_NAME}」蝦皮賣場的客服人員,請用親切、簡潔、口語化的繁體中文回覆買家,語氣要像真人客服在打字,不要太工整、太像制式範本。`,
     `注意:`,
-    `- 可以偶爾自然地加一兩個表情符號(像😊🙏這種常見客服用的),不用每句都加,依內容語氣決定。`,
+    `- 表情符號最多用一個,依內容語氣決定要不要加,不要每則都加、也不要每次都用同一個。`,
     `- 可以偶爾出現很輕微、無傷大雅的打字習慣(像少打標點、口語化的贅字),讓語氣更像真人;但「訂單編號、日期、金額、數量」這類具體數字或事實資訊絕對不能打錯或含糊帶過,錯字只能出現在無關緊要的語氣詞上。`,
+    `- 開頭不要每次都用「您好」這種制式問候,依對話情境自然接話就好(例如買家已經聊過幾句,直接回應內容即可,不用重新打招呼)。`,
+    `- 訊息長度盡量像在打字聊天,精簡自然,不要寫成一大段文情並茂的說明文;有好幾件事要交代,可以拆成幾個短句,不用硬塞成一整段。`,
     `- 如果下面「店家常見問題集」裡有符合買家問題的項目,請優先參考裡面的答案內容回覆,事實/政策細節要跟 FAQ 一致(用字可以自然微調,不用整段照抄);沒有符合的項目才自行斟酌回答。`,
     `- 目前系統還沒有連接商品/庫存/訂單資料,不要編造現貨、價格、出貨日期等具體承諾(除非 FAQ 裡已經寫明);若買家問這些且 FAQ 沒有答案,禮貌詢問更多細節(例如商品連結或名稱)。`,
     `- 這只是「草稿」,會由真人客服審核、視需要修改後才會真正送出,不確定的地方用提問代替武斷回答。`,
@@ -681,6 +683,16 @@ async function sendReply(req, res) {
   return json(res, 200, result);
 }
 
+// 依訊息長度模擬「閱讀+打字」所需時間,讓送出不是瞬間發生,體感上更像真人在打字。
+// 上限 5 秒:這裡是 Vercel serverless function,延遲太久有超時風險,節奏分散主要交給
+// /auto-send-tick 本身每 5 分鐘才觸發一次、一次只送一則的機制,這裡只是錦上添花。
+function typingDelayMs(text) {
+  const len = String(text || "").length;
+  const readingMs = 500 + Math.random() * 1000;
+  const typingMs = len * (40 + Math.random() * 30);
+  return Math.min(readingMs + typingMs, 5000);
+}
+
 // ============================================================
 //  真正呼叫蝦皮送訊 API(供 /send-reply 人工送出、/auto-send-tick 全自動送出共用)
 //  ★ 呼叫前 shop 一定要是已經 ensureFreshToken 過、access_token 有效的版本。
@@ -765,6 +777,8 @@ async function autoSendTick(req, res) {
   } catch (e) {
     return json(res, 200, { ok: false, error: "換取新 token 失敗:" + String(e.message || e) });
   }
+
+  await new Promise((r) => setTimeout(r, typingDelayMs(msg.reply_text)));
 
   const result = await sendToShopee(shop, {
     message: msg.reply_text, to_id: msg.buyer_id, conversation_id: msg.conversation_id,
