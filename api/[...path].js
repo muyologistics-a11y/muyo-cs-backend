@@ -785,6 +785,12 @@ async function autoSendTick(req, res) {
   });
   if (result.ok) {
     await sb(`messages?id=eq.${msg.id}`, "PATCH", { status: "auto_sent", handled_at: new Date().toISOString() }).catch(() => {});
+  } else {
+    // 送失敗絕對不能原地不動:不退回的話下一輪排程還是抓「最舊的一筆」,
+    // 會一直重試同一則卡住的訊息,後面排隊的訊息永遠輪不到。退回 pending
+    // 讓客服在後台看得到、能接手處理,佇列才不會被單一失敗的訊息卡死。
+    console.error("autoSendTick 送出失敗,已退回待處理:", msg.id, result.error, result.message || "");
+    await sb(`messages?id=eq.${msg.id}`, "PATCH", { status: "pending" }).catch(() => {});
   }
   return json(res, 200, { ok: result.ok, messageId: msg.id, detail: result });
 }
