@@ -515,6 +515,22 @@ async function hasSentMaterialReplyBefore(shopId, conversationId) {
   return Array.isArray(rows) && rows.length > 0;
 }
 
+// 個資遮蔽:送給 AI 的對話內容(歷史訊息 + 最新訊息)先把統編、信箱、電話換成標記,
+// AI 寫草稿用不到這些號碼,不該送到外部服務。只遮「送給 AI 的那一份」,
+// 資料庫裡的原文不動,客服在後台照樣看得到完整內容(例如要開發票)。
+// 前後不能緊貼英數字,才不會誤遮訂單編號、商品編號這類更長的英數混合字串。
+// 電話要先遮,統編(8碼)最後遮,避免號碼被拆開誤判。
+const PII_PATTERNS = [
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[信箱已遮蔽]"],
+  [/(?<![A-Za-z0-9])(?:\+?886[\s-]?|0)9\d{2}[\s-]?\d{3}[\s-]?\d{3}(?![A-Za-z0-9])/g, "[電話已遮蔽]"], // 手機
+  [/(?<![A-Za-z0-9])(?:\(0\d{1,2}\)\s?|0\d{1,2}[\s-])\d{3,4}[\s-]?\d{4}(?![A-Za-z0-9])/g, "[電話已遮蔽]"], // 市話,有區碼分隔
+  [/(?<![A-Za-z0-9])0[2-8]\d{7,8}(?![A-Za-z0-9])/g, "[電話已遮蔽]"], // 市話,連在一起
+  [/(?<![A-Za-z0-9])\d{8}(?![A-Za-z0-9])/g, "[統編已遮蔽]"],
+];
+export function maskSensitive(text) {
+  return PII_PATTERNS.reduce((s, [re, label]) => s.replace(re, label), String(text));
+}
+
 async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buyerName, messageText }) {
   const companySettings = await fetchAiSettings({ companyId });
   const aiConfig = resolveAiConfig(companySettings);
@@ -532,8 +548,8 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
   const history = await fetchConversationHistory({ shopId, conversationId, buyerId });
   const historyLines = history.flatMap((m) => {
     const lines = [];
-    if (m.customer_message) lines.push(`客人: ${m.customer_message}`);
-    if (m.reply_text) lines.push(`客服: ${m.reply_text}`);
+    if (m.customer_message) lines.push(`客人: ${maskSensitive(m.customer_message)}`);
+    if (m.reply_text) lines.push(`客服: ${maskSensitive(m.reply_text)}`);
     return lines;
   });
 
@@ -561,7 +577,7 @@ async function generateAiDraft({ companyId, shopId, conversationId, buyerId, buy
     ``,
     `以下是買家「${buyerName || "買家"}」最近的對話紀錄:`,
     ...historyLines,
-    `買家最新訊息: ${messageText}`,
+    `買家最新訊息: ${maskSensitive(messageText)}`,
   ].join("\n");
 
   let draft = await callAi(basePrompt, aiConfig);
